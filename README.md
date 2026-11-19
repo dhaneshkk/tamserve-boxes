@@ -9,6 +9,7 @@ The Rust port of [`tamserve.boxes`](https://github.com/dhaneshkk/tamserve/blob/m
 | **Reconnects** | a stream that fails or stalls is reopened, with backoff from 1 s doubling to 30 s, with jitter |
 | **Health** | per camera: state, frames decoded and used, reconnects, frame age, last error. Served as Prometheus `/metrics`, JSON `/status`, and OpenAI-compatible `/v1/chat/completions` |
 | **Throughput** | several OpenVINO requests in flight; each letterboxes its share of a look on its own thread |
+| **Recording and uplink** | SVT-AV1 (or HEVC on the integrated GPU) from the same decode as detection, each encoder held to its thread budget, low delay, segmented Matroska |
 | **Many boxes** | a coordinator assigns cameras to boxes by capacity, moves a dead box's cameras within seconds, evens out the load, and collects every result |
 | **Same results as Python** | byte-identical folded model, letterbox bit-identical to OpenCV, detections within 5e-5, the same ids on every frame |
 
@@ -89,6 +90,39 @@ On a 2-core VM at saturation (8 cameras, a look every frame), 2 requests raised 
 
 `decoder = "vaapi"` ranks GStreamer's VA-API decoders (`vah264dec`, `vah265dec`) first. `"software"` ranks them out, and `"auto"` leaves GStreamer's own ranking. Decoded frames come back to the CPU, gray, for detection. If `vaapi` is asked for and there are no VA decoders, `run` refuses to start and names the packages to install. **The VA-API path has not been tested on hardware**: the machine this was built on has no Intel GPU. Run `gst_probe` on the box first.
 
+## Recording and uplink: decode once, use twice
+
+A camera with `encode = true` is encoded from **the same decode** detection uses. After the decoder, a `tee` hands each decoded frame to both branches, each behind a leaky queue of its own, so a slow encoder drops frames (counted in `tamserve_camera_encode_dropped_total`) instead of stalling decoding or detection. There's no second RTSP connection, no second decode, and no process per camera.
+
+```
+rtsp ─ decode ─ tee ┬─ gray plane, newest frame ─▶ YOLOX (batched over all cameras) ─▶ tracker
+                    └─ frame-rate cap ─ scale ─ SVT-AV1 (1 thread, low delay) ─▶ Matroska segments
+```
+
+- **One CPU budget.** Each encoder is held to `threads` (SVT-AV1's `logical-processors`), so 20 encoders on a 4-core box don't each start a thread per core and crowd out the detector. At start-up the box logs detection threads + encoders × threads against its cores, and warns past twice the core count.
+- **Low delay, no lookahead.** SVT-AV1 runs with `pred-struct=1:lookahead=0`, so no frame waits for later ones, and constant bitrate (which SVT-AV1 only does in low delay) suits an uplink. This is also what keeps each encoder small: it holds 2 frames in flight instead of 42.
+- **Recordings.** Matroska segments of `segment_seconds`. Each frame keeps its real capture time, and after a reconnect the numbering continues rather than overwriting. `max_files` keeps a rolling window, and `output = "null"` encodes and discards, for measuring.
+- **Encoders.** `svtav1` is AV1 on the CPU, the smallest uplink for its CPU cost. `vah265` is HEVC on the integrated GPU: almost no CPU, but larger, and **untested here** (no Intel GPU). `x265` is HEVC on the CPU.
+
+Measured on a 2-core VM, 4 RTSP cameras at 15 fps, encoding to 480×320 at 10 fps, SVT-AV1 preset 12, 300 kbit/s, with YOLOX following on every camera:
+
+| 4 cameras, 1080p | CPU (cores) | memory |
+|---|---|---|
+| **one process, decode once** (this) | **1.06** | **438 MB** |
+| detection + an ffmpeg per camera, decoding again | 1.18 | 843 MB |
+| a `tamserve-boxes` process per camera | 1.02 | 822 MB |
+
+With 960×640 cameras: 0.70 / 0.71 / 0.72 cores, and 297 / 572 / 699 MB.
+
+**Memory halves; CPU falls less.** Software decoding of these streams is cheap next to encoding, so decoding once saved about 10% of CPU at 1080p and about nothing at 960×640. The CPU levers that matter are each encoder's `threads`, `preset`, `fps` and size, and decoding on the integrated GPU (`decoder = "vaapi"`), which takes decoding off the CPU altogether.
+
+What low delay is worth, measured alone (one SVT-AV1 encoder on 36 s of 1080p input, preset 12, 1 thread, 300 kbit/s):
+
+| encoding to | default (random access, lookahead) | low delay, no lookahead |
+|---|---|---|
+| 480×320 | 145 MB, 5.4 s CPU | 119 MB, 4.5 s CPU |
+| 1920×1080 | 428 MB, 12.6 s CPU | **216 MB, 8.7 s CPU** |
+
 ## Many boxes
 
 Each box has its own `cameras.toml`, passwords and all. The coordinator's config ([`config/coordinator.toml`](config/coordinator.toml)) lists only camera names and their weights, so **no camera address or password crosses the network**.
@@ -137,7 +171,7 @@ What was learned building it, on a 2-core CPU with demo data:
 ## Tests
 
 ```bash
-cargo test --release                                   # 28 tests; the 4 that need the model run when these are set:
+cargo test --release                                   # 31 tests; the 4 that need the model run when these are set:
 TAMSERVE_YOLOX_ONNX=yolox_nano.onnx TAMSERVE_DOG_JPG=dog.jpg cargo test --release
 scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs mediamtx and ffmpeg
 ```

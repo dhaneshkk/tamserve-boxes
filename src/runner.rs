@@ -156,7 +156,10 @@ impl crate::http::Source for Shared {
         use std::fmt::Write;
         let mut m = String::new();
         let cams = self.cameras.lock().unwrap();
-        let series: [(&str, &str, &str); 7] = [
+        let series: [(&str, &str, &str); 10] = [
+            ("tamserve_camera_encoded_frames_total", "counter", "frames the camera's encoder produced"),
+            ("tamserve_camera_encoded_bytes_total", "counter", "bytes the camera's encoder produced"),
+            ("tamserve_camera_encode_dropped_total", "counter", "times the encoder's backlog was full and a frame was dropped instead of stalling decoding"),
             ("tamserve_camera_up", "gauge", "1 while frames are arriving"),
             ("tamserve_camera_frames_decoded_total", "counter", "frames the decoder handed over"),
             ("tamserve_camera_frames_used_total", "counter", "frames a step used; the rest were replaced by newer ones first"),
@@ -179,6 +182,9 @@ impl crate::http::Source for Shared {
                         Some(a) => writeln!(m, "{name}{{camera=\"{c}\"}} {a:.3}"),
                         None => Ok(()),
                     },
+                    "tamserve_camera_encoded_frames_total" => writeln!(m, "{name}{{camera=\"{c}\"}} {}", h.encoded.load(Ordering::Relaxed)),
+                    "tamserve_camera_encoded_bytes_total" => writeln!(m, "{name}{{camera=\"{c}\"}} {}", h.encoded_bytes.load(Ordering::Relaxed)),
+                    "tamserve_camera_encode_dropped_total" => writeln!(m, "{name}{{camera=\"{c}\"}} {}", h.encode_dropped.load(Ordering::Relaxed)),
                     "tamserve_camera_objects" => writeln!(m, "{name}{{camera=\"{c}\"}} {}", v.latest.as_ref().map_or(0, |r| r.objects.len())),
                     _ => {
                         for s in [State::Connecting, State::Up, State::Down, State::Ended] {
@@ -213,6 +219,9 @@ impl crate::http::Source for Shared {
                 "frame_age_seconds": h.frame_age(),
                 "size": [h.width.load(Ordering::Relaxed), h.height.load(Ordering::Relaxed)],
                 "last_error": h.last_error(),
+                "encoded_frames": h.encoded.load(Ordering::Relaxed),
+                "encoded_bytes": h.encoded_bytes.load(Ordering::Relaxed),
+                "encode_dropped": h.encode_dropped.load(Ordering::Relaxed),
                 "latest": v.latest,
             }))
         }).collect();

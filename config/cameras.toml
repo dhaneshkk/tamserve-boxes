@@ -24,12 +24,26 @@ backoff_max = 30
 listen = "127.0.0.1:9300"        # /metrics (Prometheus), /status, /v1/chat/completions (OpenAI-compatible)
 # token_file = "/etc/tamserve/http.token"
 
+[encode]                         # cameras with `encode = true`, from the same decode as detection
+encoder = "svtav1"               # "vah265": HEVC on the integrated GPU, almost no CPU; "x265": HEVC on the CPU
+threads = 1                      # each encoder's threads: 20 encoders x 1 stays inside a 4-core budget
+preset = 12                      # SVT-AV1: 10 to 12 for live CCTV on a small CPU
+bitrate_kbps = 300               # low-delay CBR for the uplink; leave out for constant quality (crf = 40)
+keyframe_seconds = 2
+fps = 10                         # frames a second encoded; the decoder's others still go to detection
+width = 640                      # the uplink can be smaller than what detection sees
+height = 360
+output = "/var/lib/tamserve/{camera}/%05d.mkv"   # Matroska segments, numbered on after a reconnect
+segment_seconds = 60
+max_files = 1440                 # a day of minute segments per camera
+
 [[camera]]
 name = "gate"
 url = "rtsp://10.0.0.21/Streaming/Channels/102"
 user = "viewer"
 password_file = "/etc/tamserve/secrets/gate"
 look_every = 1                   # this camera's own
+encode = true
 
 [[camera]]
 name = "yard"

@@ -158,6 +158,21 @@ fn detect(a: &Args) -> Res<()> {
     Ok(())
 }
 
+/// One CPU budget for the box: OpenVINO's threads plus every encoder's, against the cores there are.
+#[cfg(feature = "cameras")]
+fn budget(cfg: &tamserve_boxes::config::Config, cams: &[tamserve_boxes::config::Camera]) {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let detect = cfg.detector.threads.unwrap_or(cores);
+    let encoding = cams.iter().filter(|c| c.encode).count();
+    let per = cfg.encode.as_ref().map_or(0, |e| e.threads);
+    let total = detect + encoding * per;
+    eprintln!("tamserve-boxes: CPU budget: detection {detect} thread(s) + {encoding} encoder(s) x {per} = {total} on {cores} core(s)");
+    if total > 2 * cores {
+        eprintln!("tamserve-boxes: warning: {total} threads on {cores} cores will contend; lower [encode] threads, \
+                   detector.threads, or the number of encoded cameras");
+    }
+}
+
 /// Log a camera's state when it changes: its name and host only, never its address.
 #[cfg(feature = "cameras")]
 fn log_changes(shared: &tamserve_boxes::runner::Shared, last: &mut HashMap<String, &'static str>) {
@@ -179,8 +194,9 @@ fn run(a: &Args) -> Res<()> {
         return Err("the config has no [[camera]]".into());
     }
     camera::init(cfg.decode.decoder)?;
+    budget(&cfg, &cams);
     let tracker = BoxTracker::from_model(&cfg.detector.model, cfg.detector_options(), cfg.tracker_options(&cams))?;
-    let mut runner = Runner::new(tracker, camera::Opening::from(&cfg.decode));
+    let mut runner = Runner::new(tracker, camera::Opening::from(&cfg.decode).with_encode(cfg.encode.clone()));
     runner.set_cameras(&cams)?;
     if let Some(l) = &cfg.http.listen {
         let base = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));
@@ -339,8 +355,9 @@ fn run_box(a: &Args) -> Res<()> {
     let name = a.get("name").ok_or("--name is needed: what the coordinator calls this box")?.to_string();
     let capacity: f64 = a.num("capacity", cams.iter().map(|c| c.weight).sum::<f64>())?;
     camera::init(cfg.decode.decoder)?;
+    budget(&cfg, &cams);
     let tracker = BoxTracker::from_model(&cfg.detector.model, cfg.detector_options(), cfg.tracker_options(&cams))?;
-    let mut runner = Runner::new(tracker, camera::Opening::from(&cfg.decode));
+    let mut runner = Runner::new(tracker, camera::Opening::from(&cfg.decode).with_encode(cfg.encode.clone()));
     let shared = runner.shared.clone();
     if let Some(l) = &cfg.http.listen {
         let base = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));

@@ -21,7 +21,7 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
 
-use crate::config::{Camera, DecodeSection, Decoder};
+use crate::config::{Camera, DecodeSection, Decoder, EncodeSection, Encoder};
 use crate::{Error, Result};
 
 /// Where a camera stands.
@@ -81,6 +81,11 @@ pub struct Health {
     pub generation: AtomicU64,
     pub width: AtomicU64,
     pub height: AtomicU64,
+    /// Frames and bytes the encoder has produced (cameras with `encode = true`).
+    pub encoded: AtomicU64,
+    pub encoded_bytes: AtomicU64,
+    /// Times the encoder's backlog was full, so a frame was dropped rather than stall decoding.
+    pub encode_dropped: AtomicU64,
     last_error: Mutex<String>,
 }
 
@@ -167,11 +172,21 @@ pub struct Opening {
     pub stall: Duration,
     pub backoff: Backoff,
     pub realtime: bool,
+    /// How cameras with `encode = true` are encoded, from the same decode.
+    pub encode: Option<EncodeSection>,
+}
+
+impl Opening {
+    pub fn with_encode(mut self, e: Option<EncodeSection>) -> Self {
+        self.encode = e;
+        self
+    }
 }
 
 impl From<&DecodeSection> for Opening {
     fn from(d: &DecodeSection) -> Self {
         Opening {
+            encode: None,
             decoder: d.decoder,
             width: d.width,
             height: d.height,
@@ -310,6 +325,81 @@ enum Outcome {
     Failed(String),
 }
 
+/// A name safe in a file path: letters, digits, '-', '_' and '.'; anything else becomes '_'.
+fn safe(name: &str) -> String {
+    name.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '_' }).collect()
+}
+
+/// The segment number to start at, so a reconnect continues a camera's numbering and never
+/// overwrites the segments it already wrote. `pattern` has one `%0Nd`.
+fn next_index(pattern: &str) -> Result<u32> {
+    let p = std::path::Path::new(pattern);
+    let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let file = p.file_name().and_then(|f| f.to_str()).unwrap_or("");
+    let (Some(at), Some(end)) = (file.find('%'), file.find('d')) else { return Ok(0) };
+    let (head, tail) = (&file[..at], &file[end + 1..]);
+    let mut next = 0;
+    for e in std::fs::read_dir(dir)?.flatten() {
+        let n = e.file_name();
+        let n = n.to_string_lossy();
+        if let Some(num) = n.strip_prefix(head).and_then(|r| r.strip_suffix(tail)) {
+            if let Ok(i) = num.parse::<u32>() {
+                next = next.max(i + 1);
+            }
+        }
+    }
+    Ok(next)
+}
+
+/// The encoder branch of a camera's pipeline, after the tee: a frame-rate cap, scaling, the
+/// encoder at its thread budget and low-delay settings, and the segments (or nothing).
+fn encode_branch(camera: &Camera, e: &EncodeSection) -> Result<String> {
+    let fps = e.fps.unwrap_or(25);
+    let key = ((e.keyframe_seconds * fps as f64).round() as u32).max(1);
+    let mut b = format!("t. ! queue name=encq leaky=downstream max-size-buffers={} max-size-bytes=0 max-size-time=0 ! ", e.backlog);
+    if let Some(f) = e.fps {
+        b += &format!("videorate drop-only=true ! video/x-raw,framerate={f}/1 ! ");
+    }
+    let format = if e.encoder == Encoder::Vah265 { "NV12" } else { "I420" };
+    b += "videoconvert ! ";
+    let mut caps = format!("video/x-raw,format={format}");
+    if let (Some(w), Some(h)) = (e.width, e.height) {
+        b += "videoscale ! ";
+        caps += &format!(",width={w},height={h}");
+    }
+    b += &caps;
+    b += " ! ";
+    b += &match e.encoder {
+        // Low delay (pred-struct=1): no frame waits for later ones, and SVT-AV1's CBR needs it.
+        // No lookahead: what keeps each encoder's memory small. Threads capped per encoder.
+        Encoder::Svtav1 => {
+            let rate = match e.bitrate_kbps { Some(k) => format!("target-bitrate={k} crf=-1"), None => format!("crf={}", e.crf) };
+            format!("svtav1enc name=enc preset={} logical-processors={} intra-period-length={} {rate} \
+                     parameters-string=\"pred-struct=1:lookahead=0\" ! av1parse", e.preset, e.threads, key - 1)
+        }
+        Encoder::Vah265 => {
+            let rate = match e.bitrate_kbps { Some(k) => format!("rate-control=cbr bitrate={k}"), None => format!("rate-control=cqp qpi={}", e.crf.clamp(0, 51)) };
+            format!("vah265enc name=enc key-int-max={key} b-frames=0 target-usage=7 {rate} ! h265parse")
+        }
+        Encoder::X265 => {
+            let (rate, crf) = match e.bitrate_kbps { Some(k) => (format!("bitrate={k}"), String::new()), None => (String::new(), format!(":crf={}", e.crf)) };
+            format!("x265enc name=enc speed-preset=ultrafast tune=zerolatency key-int-max={key} {rate} \
+                     option-string=\"pools={}:frame-threads=1{crf}\" ! h265parse", e.threads)
+        }
+    };
+    if e.output == "null" {
+        b += " ! fakesink sync=false";
+    } else {
+        let location = e.output.replace("{camera}", &safe(&camera.name));
+        let start = next_index(&location)?;
+        b += &format!(" ! splitmuxsink async-finalize=true muxer-factory=matroskamux location={} start-index={start} \
+                       max-size-time={} max-files={} send-keyframe-requests=true",
+                      quote(&location), (e.segment_seconds * 1e9) as u64, e.max_files);
+    }
+    Ok(b)
+}
+
 fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -322,9 +412,23 @@ fn stream(camera: &Camera, target: &str, how: &Opening, health: &Arc<Health>, ne
         caps += &format!(",width={w},height={h}");
     }
     let sync = how.realtime || !is_live(target);
-    let desc = format!("uridecodebin name=src uri={} ! videoconvert ! videoscale ! {caps} ! \
-                        appsink name=sink max-buffers=1 drop=true sync={sync} enable-last-sample=false",
-                       quote(target));
+    let detect = format!("videoconvert ! videoscale ! {caps} ! appsink name=sink max-buffers=1 drop=true sync={sync} \
+                          enable-last-sample=false");
+    // Decode once, use twice: a tee hands the decoder's frames to detection and to the encoder, each
+    // behind a leaky queue of its own, so neither can stall the decoder or the other.
+    let encoding = match (&how.encode, camera.encode) {
+        (Some(e), true) => match encode_branch(camera, e) {
+            Ok(b) => Some(b),
+            Err(err) => return Outcome::Failed(format!("cannot set up the encoder: {err}")),
+        },
+        _ => None,
+    };
+    let desc = match &encoding {
+        None => format!("uridecodebin name=src uri={} ! {detect}", quote(target)),
+        Some(enc) => format!("uridecodebin name=src uri={} ! tee name=t \
+                              t. ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 ! {detect} \
+                              {enc}", quote(target)),
+    };
     let pipeline = match gst::parse::launch(&desc) {
         Ok(p) => match p.downcast::<gst::Pipeline>() {
             Ok(p) => p,
@@ -357,6 +461,26 @@ fn stream(camera: &Camera, target: &str, how: &Opening, health: &Arc<Health>, ne
             }
             None
         });
+    }
+    if encoding.is_some() {
+        // Count what the encoder produces, and how often its backlog was full.
+        if let Some(pad) = pipeline.by_name("enc").and_then(|e| e.static_pad("src")) {
+            let h = health.clone();
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(b) = info.buffer() {
+                    h.encoded.fetch_add(1, Ordering::Relaxed);
+                    h.encoded_bytes.fetch_add(b.size() as u64, Ordering::Relaxed);
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
+        if let Some(q) = pipeline.by_name("encq") {
+            let h = health.clone();
+            q.connect("overrun", false, move |_| {
+                h.encode_dropped.fetch_add(1, Ordering::Relaxed);
+                None
+            });
+        }
     }
     let Some(sink) = pipeline.by_name("sink").and_then(|s| s.downcast::<gst_app::AppSink>().ok()) else {
         return Outcome::Failed("no appsink".into());
@@ -429,4 +553,29 @@ fn stream(camera: &Camera, target: &str, how: &Opening, health: &Arc<Health>, ne
     };
     let _ = pipeline.set_state(gst::State::Null);
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reconnect_continues_the_segment_numbers() {
+        let mut r = [0u8; 8];
+        getrandom::fill(&mut r).unwrap();
+        let d = std::env::temp_dir().join(format!("tsb-seg-{}", u64::from_le_bytes(r)));
+        let pattern = format!("{}/gate/%05d.mkv", d.display());
+        assert_eq!(next_index(&pattern).unwrap(), 0); // and the folder is made
+        for i in [0, 1, 7] {
+            std::fs::write(d.join(format!("gate/{i:05}.mkv")), b"x").unwrap();
+        }
+        std::fs::write(d.join("gate/notes.txt"), b"x").unwrap();
+        assert_eq!(next_index(&pattern).unwrap(), 8);
+    }
+
+    #[test]
+    fn camera_names_are_safe_in_paths() {
+        assert_eq!(safe("gate/../../etc"), "gate_.._.._etc");
+        assert_eq!(safe("Dock 3"), "Dock_3");
+    }
 }

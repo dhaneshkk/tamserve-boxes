@@ -53,6 +53,16 @@ curl -sf localhost:19301/metrics | grep -q 'tamserve_camera_up{camera="c1"} 1' &
 curl -sf -X POST localhost:19301/v1/chat/completions -d '{"model":"c1","messages":[{"role":"user","content":"?"}]}' \
   | python3 -c "import json,sys; r=json.load(sys.stdin); assert r['object']=='chat.completion'; json.loads(r['choices'][0]['message']['content'])" \
   && echo "ok: OpenAI-compatible /v1/chat/completions"
+kill $SOLO; sleep 1
+# Decode once, use twice: c1 is also encoded, from the same decode, to AV1 segments.
+box_config 19301 | sed 's|^\[http\]|[encode]\nthreads = 1\npreset = 12\nbitrate_kbps = 300\nfps = 10\nwidth = 480\nheight = 320\noutput = "'"$W"'/rec/{camera}/%05d.mkv"\nsegment_seconds = 4\n\n[http]|' \
+  | awk '/name = "c1"/ {print; print "encode = true"; next} {print}' > solo.toml
+"$B" run --config solo.toml > solo.jsonl 2> solo.log & SOLO=$!
+sleep 12
+check "s['cameras']['c1']['encoded_frames'] > 50 and s['cameras']['c2']['encoded_frames'] == 0 and s['cameras']['c1']['frames_used'] > 50" "$(status 19301)" "c1 is detected and encoded from one decode"
+SEG=$(ls "$W"/rec/c1/*.mkv | head -1)
+[ "$(ffprobe -v error -select_streams v -show_entries stream=codec_name -of csv=p=0 "$SEG")" = av1 ] && echo "ok: c1's segments are AV1" \
+  || { echo "FAIL: no AV1 segment for c1"; exit 1; }
 pkill -f "mediamtx mediamtx.yml"; sleep 6
 check "all(s['cameras'][c]['state'] in ('down','connecting') for c in ['c1','c2'])" "$(status 19301)" "cameras go down with the server"
 "$MTX" mediamtx.yml & sleep 1; pkill -f "ffmpeg.*18554" || true; sleep 0.5; publish; sleep 10
