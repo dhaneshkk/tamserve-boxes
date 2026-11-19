@@ -23,7 +23,7 @@ fn floats(t: &TensorProto) -> Result<Vec<f32>> {
         return Err(bad(format!("{} is not float32", t.name)));
     }
     if !t.raw_data.is_empty() {
-        Ok(t.raw_data.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+        Ok(t.raw_data.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect())
     } else {
         Ok(t.float_data.clone())
     }
@@ -34,7 +34,7 @@ fn int64s(t: &TensorProto) -> Option<Vec<i64>> {
         return None;
     }
     Some(if !t.raw_data.is_empty() {
-        t.raw_data.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect()
+        t.raw_data.as_chunks::<8>().0.iter().map(|c| i64::from_le_bytes(*c)).collect()
     } else {
         t.int64_data.clone()
     })
