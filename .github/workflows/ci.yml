@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: GStreamer
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
+      - name: OpenVINO's C library (from the pip wheel, under the name the bindings look for)
+        run: |
+          pip install -q "openvino>=2024.0"
+          OV=$(python3 -c "import openvino, os; print(os.path.dirname(openvino.__file__))")/libs
+          mkdir -p "$HOME/ovlib" && ln -sf "$OV"/libopenvino_c.so.* "$HOME/ovlib/libopenvino_c.so"
+          echo "LD_LIBRARY_PATH=$HOME/ovlib:$OV" >> "$GITHUB_ENV"
+      - name: YOLOX-Nano and its test picture, pinned
+        run: |
+          mkdir -p "$HOME/models" && cd "$HOME/models"
+          curl -sSLo yolox_nano.onnx https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_nano.onnx
+          curl -sSLo dog.jpg https://raw.githubusercontent.com/Megvii-BaseDetection/YOLOX/6ddff4824372906469a7fae2dc3206c7aa4bbaee/assets/dog.jpg
+          echo "c789161ed43c8269fcd4e67c67eeeb4e80c622da2eb296a20bc6007bd18a0b7d  yolox_nano.onnx" | sha256sum -c
+          echo "5a9522051c3cec2bbd2f6323fccba32e8fbf3ddcc2b3e2fd46b04c720bc6f866  dog.jpg" | sha256sum -c
+          echo "TAMSERVE_YOLOX_ONNX=$HOME/models/yolox_nano.onnx" >> "$GITHUB_ENV"
+          echo "TAMSERVE_DOG_JPG=$HOME/models/dog.jpg" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --all-targets
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release
+      - name: Without the optional features
+        run: cargo build --release --no-default-features

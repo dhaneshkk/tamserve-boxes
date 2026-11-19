@@ -1,6 +1,6 @@
 # tamserve-boxes
 
-The Rust port of [`tamserve.boxes`](../docs/cpu-boxes.md): find and follow boxes on many cameras with **YOLOX-Nano on gray frames, on the CPU through OpenVINO**, for edge boxes with no NVIDIA GPU such as an Intel N100. It's one binary: no Python, no PyTorch. It reads cameras in-process with GStreamer, keeps them connected, reports their health, and spreads them over several boxes with a coordinator.
+The Rust port of [`tamserve.boxes`](https://github.com/dhaneshkk/tamserve/blob/main/docs/cpu-boxes.md) (from [tamserve](https://github.com/dhaneshkk/tamserve/)): find and follow boxes on many cameras with **YOLOX-Nano on gray frames, on the CPU through OpenVINO**, for edge boxes with no NVIDIA GPU such as an Intel N100. It's one binary: no Python, no PyTorch. It reads cameras in-process with GStreamer, keeps them connected, reports their health, and spreads them over several boxes with a coordinator.
 
 | | |
 |---|---|
@@ -109,7 +109,7 @@ tamserve-boxes box --config cameras.toml --coordinator 10.0.0.2:7400 --token-fil
 
 ## Fine-tuning on your sites
 
-[`notebooks/finetune_gray.ipynb`](../notebooks/finetune_gray.ipynb) is one cell. Point `DATA` at labelled frames from your cameras (COCO JSON or YOLO txt), and it:
+[`notebooks/finetune_gray.ipynb`](notebooks/finetune_gray.ipynb) is one cell. Point `DATA` at labelled frames from your cameras (COCO JSON or YOLO txt), and it:
 
 1. folds YOLOX-Nano's released weights to 1 channel, checked exact against the 3-channel model;
 2. trains on your frames, read as gray, with Sharpness-Aware Minimization around SGD;
@@ -164,7 +164,7 @@ scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs m
 
 ## Licences
 
-Apache-2.0, as tamserve. Dependencies:
+Apache-2.0 (see `LICENSE` and `NOTICE`). Dependencies:
 - `openvino` and the GStreamer bindings: Apache-2.0 / MIT.
 - GStreamer itself: LGPL, linked at run time.
 - `onnx-protobuf`: MPL-2.0, only with `fold`.

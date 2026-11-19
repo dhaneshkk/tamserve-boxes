@@ -3,8 +3,8 @@ name = "tamserve-boxes"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Find and follow boxes on many cameras with YOLOX-Nano on gray frames, on the CPU through OpenVINO: the Rust port of tamserve.boxes."
-repository = "https://github.com/dhaneshkk/tamserve"
+description = "Find and follow boxes on many CCTV cameras with YOLOX-Nano on gray frames, on the CPU through OpenVINO: GStreamer cameras, reconnects, health metrics and a coordinator for many boxes."
+repository = "https://github.com/dhaneshkk/tamserve-boxes"
 
 [features]
 # fold: make the 1-channel model from YOLOX's own ONNX file (tamserve-boxes fold). Not needed to run one.

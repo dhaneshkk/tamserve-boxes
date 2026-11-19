@@ -1,7 +1,7 @@
 #!/bin/bash
 # End-to-end test with a real RTSP server that needs a password: reconnects, health metrics, passwords kept off
 # command lines, and a coordinator moving cameras off a box that is killed. Needs: mediamtx, ffmpeg, curl, python3,
-# OpenVINO's C library on LD_LIBRARY_PATH, and the release binary. Run from rust/:
+# OpenVINO's C library on LD_LIBRARY_PATH, and the release binary. Run from the repository's root:
 #   scripts/rtsp_test.sh MODEL.onnx VIDEO.mp4
 # MODEL: a 1-channel YOLOX (tamserve-boxes fold); VIDEO: any short H.264 video. Exits non-zero on any failure.
 set -euo pipefail

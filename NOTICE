@@ -1,0 +1,7 @@
+tamserve-boxes
+Copyright 2026 Dhanesh and contributors
+
+This crate began as the rust/ folder of a fork of tamserve (https://github.com/aryamandarda/tamserve,
+Apache-2.0, by Aryaman Darda): it is the Rust port of that fork's tamserve.boxes, and its git history
+starts there. It runs YOLOX (https://github.com/Megvii-BaseDetection/YOLOX, Apache-2.0, Megvii), whose
+weights it downloads and does not redistribute.
