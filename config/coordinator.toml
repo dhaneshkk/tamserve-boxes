@@ -1,0 +1,19 @@
+# tamserve-boxes coordinator: which cameras exist, and what each costs. No addresses or passwords here:
+# every box has its own cameras.toml, and the coordinator only tells each box which of its cameras to serve.
+
+listen = "0.0.0.0:7400"          # boxes connect here
+token_file = "/etc/tamserve/coordinator.token"   # head -c 32 /dev/urandom | base64 > ...; chmod 600; same on every box
+dead_seconds = 5                 # a box silent this long is gone, and its cameras move
+rebalance_gap = 0.25             # move one camera at a time while boxes differ by more than this in how full they are
+http = "127.0.0.1:9400"          # /metrics, /status, /v1/chat/completions for every camera, whichever box serves it
+
+[[camera]]
+name = "gate"
+weight = 3                       # looks every frame: three times a camera that looks every third
+
+[[camera]]
+name = "yard"
+
+[[camera]]
+name = "dock"
+boxes = ["box-north"]            # only this box may serve it

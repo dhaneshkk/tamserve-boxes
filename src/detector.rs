@@ -33,6 +33,11 @@ pub struct DetectorOptions {
     pub precision: Option<String>,
     /// The OpenVINO device: `"CPU"`.
     pub device: String,
+    /// Inference requests in flight at once. A look's frames are split between them, and
+    /// each request letterboxes its share on a thread of its own and runs in an OpenVINO
+    /// stream of its own, so several cores work on one look. 1 suits a light load; more
+    /// keep up with more cameras. Splitting does not change any frame's finds.
+    pub requests: usize,
 }
 
 impl Default for DetectorOptions {
@@ -47,20 +52,31 @@ impl Default for DetectorOptions {
             names: COCO.iter().map(|s| s.to_string()).collect(),
             precision: None,
             device: "CPU".into(),
+            requests: 1,
         }
     }
 }
 
-/// YOLOX-Nano (or any YOLOX) taking 1-channel frames, through OpenVINO.
-pub struct Detector {
-    opts: DetectorOptions,
-    keep: Option<Vec<usize>>, // class indices kept, in the order of `classes`
+/// One inference request, with what it letterboxes into.
+struct Lane {
     request: InferRequest,
-    _compiled: openvino::CompiledModel,
-    _core: Core,
-    cells: Vec<(f32, f32, f32)>, // each anchor's cell x, cell y and stride, as YOLOX's head lists them
     input: Option<(usize, Tensor)>,
     scratch: Vec<u8>,
+}
+
+/// What turns the model's raw output into finds: plain data, shared by the requests' threads.
+struct Head {
+    opts: DetectorOptions,
+    keep: Option<Vec<usize>>,    // class indices kept, in the order of `classes`
+    cells: Vec<(f32, f32, f32)>, // each anchor's cell x, cell y and stride, as YOLOX's head lists them
+}
+
+/// YOLOX-Nano (or any YOLOX) taking 1-channel frames, through OpenVINO.
+pub struct Detector {
+    head: Head,
+    lanes: Vec<Lane>,
+    _compiled: openvino::CompiledModel,
+    _core: Core,
 }
 
 fn ov<E: std::fmt::Display>(e: E) -> Error {
@@ -96,8 +112,13 @@ impl Detector {
             .map_err(ov)?;
         m.reshape_single_input(&shape).map_err(ov)?;
         let device = DeviceType::from(opts.device.as_str()).to_owned();
-        let mut props = vec![(RwPropertyKey::HintPerformanceMode, "LATENCY".to_string()),
-                             (RwPropertyKey::NumStreams, "1".to_string())];
+        if opts.requests == 0 {
+            return Err(Error::Invalid("requests must be at least 1".into()));
+        }
+        // One request: lowest latency. Several: one OpenVINO stream each, so they run at once.
+        let hint = if opts.requests == 1 { "LATENCY" } else { "THROUGHPUT" };
+        let mut props = vec![(RwPropertyKey::HintPerformanceMode, hint.to_string()),
+                             (RwPropertyKey::NumStreams, opts.requests.to_string())];
         if opts.device == "CPU" {
             props.push((RwPropertyKey::HintEnableCpuPinning, if opts.pin { "YES" } else { "NO" }.to_string()));
             if let Some(t) = opts.threads {
@@ -111,7 +132,9 @@ impl Detector {
             core.set_property(&device, k, v).map_err(ov)?;
         }
         let mut compiled = core.compile_model(&m, device).map_err(ov)?;
-        let request = compiled.create_infer_request().map_err(ov)?;
+        let lanes = (0..opts.requests)
+            .map(|_| Ok(Lane { request: compiled.create_infer_request().map_err(ov)?, input: None, scratch: Vec::new() }))
+            .collect::<Result<Vec<_>>>()?;
         let mut cells = Vec::new();
         for s in STRIDES {
             let n = opts.size / s;
@@ -121,9 +144,12 @@ impl Detector {
                 }
             }
         }
-        Ok(Detector { opts, keep, request, _compiled: compiled, _core: core, cells, input: None, scratch: Vec::new() })
+        Ok(Detector { head: Head { opts, keep, cells }, lanes, _compiled: compiled, _core: core })
     }
 
+}
+
+impl Head {
     /// One frame's raw head output (anchors x (5 + classes)) as finds.
     fn decode(&self, raw: &[f32], scale: f32, width: usize, height: usize) -> Finds {
         let row = 5 + self.opts.names.len();
@@ -168,32 +194,70 @@ impl Detector {
 
 impl Detect for Detector {
     fn names(&self) -> &[String] {
-        &self.opts.names
+        &self.head.opts.names
     }
 
     fn detect(&mut self, frames: &[GrayFrame]) -> Result<Vec<Finds>> {
         if frames.is_empty() {
             return Ok(Vec::new());
         }
-        let (n, s) = (frames.len(), self.opts.size);
-        if self.input.as_ref().map(|(k, _)| *k) != Some(n) {
-            // Not padded to fixed sizes: OpenVINO's CPU plugin takes any batch, and padding is wasted work.
-            let t = Tensor::new(ElementType::F32, &Shape::new(&[n as i64, 1, s as i64, s as i64]).map_err(ov)?)
-                .map_err(ov)?;
-            self.input = Some((n, t));
+        // Split the frames between the requests, in order, as evenly as they go.
+        let n = frames.len();
+        let k = self.lanes.len().min(n);
+        let mut chunks = Vec::with_capacity(k);
+        let mut start = 0;
+        for i in 0..k {
+            let len = n / k + usize::from(i < n % k);
+            chunks.push(&frames[start..start + len]);
+            start += len;
         }
-        let (_, tensor) = self.input.as_mut().unwrap();
-        let data = tensor.get_data_mut::<f32>().map_err(ov)?;
-        data.fill(PAD);
-        let mut scales = Vec::with_capacity(n);
-        for (i, f) in frames.iter().enumerate() {
-            scales.push(letterbox(f, s, &mut data[i * s * s..(i + 1) * s * s], &mut self.scratch));
+        let head = &self.head;
+        let size = head.opts.size;
+        let work = |lane: &mut Lane, chunk: &[GrayFrame]| -> Result<Vec<Finds>> {
+            let (raw, per, scales) = run_lane(lane, chunk, size)?;
+            Ok(chunk.iter().enumerate()
+                .map(|(i, f)| head.decode(&raw[i * per..(i + 1) * per], scales[i], f.width, f.height))
+                .collect())
+        };
+        let results: Vec<Result<Vec<Finds>>> = if k == 1 {
+            vec![work(&mut self.lanes[0], chunks[0])]
+        } else {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = self.lanes.iter_mut().zip(&chunks)
+                    .map(|(lane, chunk)| s.spawn(move || work(lane, chunk)))
+                    .collect();
+                handles.into_iter()
+                    .map(|h| h.join().unwrap_or_else(|_| Err(Error::OpenVino("a request's thread panicked".into()))))
+                    .collect()
+            })
+        };
+        let mut out = Vec::with_capacity(n);
+        for r in results {
+            out.extend(r?);
         }
-        self.request.set_input_tensor(tensor).map_err(ov)?;
-        self.request.infer().map_err(ov)?;
-        let out = self.request.get_output_tensor().map_err(ov)?;
-        let raw = out.get_data::<f32>().map_err(ov)?;
-        let per = raw.len() / n;
-        Ok(frames.iter().enumerate().map(|(i, f)| self.decode(&raw[i * per..(i + 1) * per], scales[i], f.width, f.height)).collect())
+        Ok(out)
     }
+}
+
+/// Letterbox `frames` into a lane's input and run its request: (raw output, floats per frame, scales).
+fn run_lane(lane: &mut Lane, frames: &[GrayFrame], s: usize) -> Result<(Vec<f32>, usize, Vec<f32>)> {
+    let n = frames.len();
+    if lane.input.as_ref().map(|(k, _)| *k) != Some(n) {
+        // Not padded to fixed sizes: OpenVINO's CPU plugin takes any batch, and padding is wasted work.
+        let t = Tensor::new(ElementType::F32, &Shape::new(&[n as i64, 1, s as i64, s as i64]).map_err(ov)?).map_err(ov)?;
+        lane.input = Some((n, t));
+    }
+    let (_, tensor) = lane.input.as_mut().unwrap();
+    let data = tensor.get_data_mut::<f32>().map_err(ov)?;
+    data.fill(PAD);
+    let mut scales = Vec::with_capacity(n);
+    for (i, f) in frames.iter().enumerate() {
+        scales.push(letterbox(f, s, &mut data[i * s * s..(i + 1) * s * s], &mut lane.scratch));
+    }
+    lane.request.set_input_tensor(tensor).map_err(ov)?;
+    lane.request.infer().map_err(ov)?;
+    let out = lane.request.get_output_tensor().map_err(ov)?;
+    let raw = out.get_data::<f32>().map_err(ov)?.to_vec();
+    let per = raw.len() / n;
+    Ok((raw, per, scales))
 }

@@ -77,3 +77,17 @@ fn letterbox_matches_opencv_on_a_known_case() {
     image::resize_linear(&GrayFrame::new(&src, 4, 3).unwrap(), 3, 2, &mut out);
     assert_eq!(out, [9, 63, 116, 24, 78, 131]);
 }
+
+#[test]
+fn splitting_a_look_across_requests_changes_no_frame() {
+    let Some((model, gray, w, h)) = inputs() else { return };
+    let path = gray_model(&model);
+    let flipped: Vec<u8> = gray.chunks(w).flat_map(|r| r.iter().rev().copied().collect::<Vec<_>>()).collect();
+    let frames: Vec<GrayFrame> = (0..7).map(|i| GrayFrame::new(if i % 2 == 0 { &gray } else { &flipped }, w, h).unwrap()).collect();
+    let mut one = Detector::new(&path, classes()).unwrap();
+    let want = one.detect(&frames).unwrap();
+    for requests in [2, 3, 4] {
+        let mut many = Detector::new(&path, DetectorOptions { requests, threads: Some(2), ..classes() }).unwrap();
+        assert_eq!(many.detect(&frames).unwrap(), want, "{requests} requests");
+    }
+}

@@ -9,13 +9,24 @@ repository = "https://github.com/dhaneshkk/tamserve"
 [features]
 # fold: make the 1-channel model from YOLOX's own ONNX file (tamserve-boxes fold). Not needed to run one.
 fold = ["dep:onnx-protobuf", "dep:protobuf"]
-default = ["fold"]
+# cameras: read cameras in this process with GStreamer (RTSP, files; VA-API decoding where the box has it).
+cameras = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
+default = ["fold", "cameras"]
 
 [dependencies]
 # OpenVINO's C library is loaded at run time: put its folder on LD_LIBRARY_PATH or set OPENVINO_INSTALL_DIR.
 openvino = { version = "0.11.1", features = ["runtime-linking"] }
 onnx-protobuf = { version = "0.2.3", optional = true }  # MPL-2.0
 protobuf = { version = "=3.4.0", optional = true }  # the version onnx-protobuf's generated code was made with
+gstreamer = { version = "0.25", optional = true }
+gstreamer-app = { version = "0.25", optional = true }
+gstreamer-video = { version = "0.25", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.3"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg"] }

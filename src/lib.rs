@@ -31,11 +31,18 @@
 //! # Ok::<(), tamserve_boxes::Error>(())
 //! ```
 
+#[cfg(feature = "cameras")]
+pub mod camera;
+pub mod config;
+pub mod coord;
 mod detector;
 #[cfg(feature = "fold")]
 pub mod fold;
+pub mod http;
 pub mod image;
 mod kalman;
+#[cfg(feature = "cameras")]
+pub mod runner;
 mod tracker;
 
 pub use detector::{Detector, DetectorOptions};
@@ -166,4 +173,9 @@ pub(crate) fn iou(a: &BBox, b: &BBox) -> f32 {
     let inter = w * h;
     let area = |x: &BBox| (x[2] - x[0]).max(0.0) * (x[3] - x[1]).max(0.0);
     inter / (area(a) + area(b) - inter).max(1e-9)
+}
+
+/// Milliseconds since 1970.
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }

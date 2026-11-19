@@ -1,0 +1,38 @@
+# tamserve-boxes: one box's cameras. Passwords never go on a command line or into a URL:
+# each comes from a file only this user can read (chmod 600), or from the environment.
+
+[detector]
+model = "yolox_nano_gray.onnx"   # tamserve-boxes fold yolox_nano.onnx yolox_nano_gray.onnx
+threads = 3                      # OpenVINO threads: leave a core for decoding (4-core N100: 3)
+requests = 2                     # inference requests in flight; a look's frames are split between them
+classes = ["person", "car", "truck"]
+# names = ["person", "helmet"]  # a fine-tuned model's classes, from its .names.json, if not COCO's
+
+[tracker]
+look_every = 3                   # frames between a camera's looks
+hold = 30
+
+[decode]
+decoder = "vaapi"                # "auto", "software", or "vaapi" (H.264/H.265 on the integrated GPU)
+width = 640                      # scale first; better still, point the URL at the camera's sub-stream
+height = 360
+stall_seconds = 10               # no frame for this long: reopen the stream
+backoff_first = 1                # reconnect delays: 1 s, doubling to 30 s, with jitter
+backoff_max = 30
+
+[http]
+listen = "127.0.0.1:9300"        # /metrics (Prometheus), /status, /v1/chat/completions (OpenAI-compatible)
+# token_file = "/etc/tamserve/http.token"
+
+[[camera]]
+name = "gate"
+url = "rtsp://10.0.0.21/Streaming/Channels/102"
+user = "viewer"
+password_file = "/etc/tamserve/secrets/gate"
+look_every = 1                   # this camera's own
+
+[[camera]]
+name = "yard"
+url = "rtsp://10.0.0.22/Streaming/Channels/102"
+user = "viewer"
+password_env = "YARD_PASSWORD"

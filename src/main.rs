@@ -3,18 +3,21 @@
 //!
 //!   tamserve-boxes fold yolox_nano.onnx yolox_nano_gray.onnx
 //!   tamserve-boxes detect --model yolox_nano_gray.onnx picture.pgm ...
-//!   tamserve-boxes run --model yolox_nano_gray.onnx --camera gate=rtsp://... --camera yard=rtsp://...
+//!   tamserve-boxes run --config cameras.toml
+//!   tamserve-boxes box --config cameras.toml --coordinator 10.0.0.2:7400 --token-file token --name box-a
+//!   tamserve-boxes coordinator --config coordinator.toml
 //!   tamserve-boxes bench --model yolox_nano_gray.onnx --image picture.pgm --cameras 8 --fps 25
 //!
-//! `run` reads each camera through ffmpeg, which hands over the gray picture (the Y
-//! plane) with no colour conversion, keeps only each camera's newest frame, and prints
-//! one JSON line per camera per round. OpenVINO's C library is found at run time: put
-//! its folder on LD_LIBRARY_PATH or set OPENVINO_INSTALL_DIR.
+//! `run` reads the cameras in its config in this process with GStreamer (the gray plane,
+//! the newest frame only, reconnecting with backoff), and prints one JSON line per camera
+//! per step; its HTTP endpoint serves metrics. `box` and `coordinator` spread cameras over
+//! several boxes. OpenVINO's C library is found at run time: put its folder on
+//! LD_LIBRARY_PATH or set OPENVINO_INSTALL_DIR.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+#[cfg(feature = "cameras")]
+use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use tamserve_boxes::{BoxTracker, Detect, Detector, DetectorOptions, GrayFrame, LookEvery, TrackerOptions};
@@ -24,11 +27,11 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 const USAGE: &str = "usage:
   tamserve-boxes fold IN.onnx OUT.onnx
   tamserve-boxes detect --model M [--threads N] [--classes a,b] PICTURE.pgm ...
-  tamserve-boxes run --model M --camera NAME=URL [--camera ...] [--threads N] [--look-every K]
-                     [--look NAME=K ...] [--hold F] [--classes a,b] [--width W --height H] [--hwaccel vaapi]
-                     [--realtime]   (read recordings at their own frame rate, as cameras would send them)
+  tamserve-boxes run --config cameras.toml
+  tamserve-boxes box --config cameras.toml --coordinator HOST:PORT --token-file F --name NAME [--capacity W]
+  tamserve-boxes coordinator --config coordinator.toml
   tamserve-boxes bench --model M --image PICTURE.pgm [--cameras 4] [--fps 10] [--seconds 20]
-                       [--threads 1] [--look-every 3] [--separate]";
+                       [--threads 1] [--requests 1] [--look-every 3] [--separate]";
 
 /// Options as `--key value`, repeatable, and the arguments that are not options.
 struct Args {
@@ -59,9 +62,6 @@ impl Args {
     }
     fn get(&self, k: &str) -> Option<&str> {
         self.opts.get(k).and_then(|v| v.last()).map(|s| s.as_str())
-    }
-    fn all(&self, k: &str) -> &[String] {
-        self.opts.get(k).map(|v| v.as_slice()).unwrap_or(&[])
     }
     fn num<T: std::str::FromStr>(&self, k: &str, default: T) -> Res<T> {
         match self.get(k) {
@@ -158,145 +158,55 @@ fn detect(a: &Args) -> Res<()> {
     Ok(())
 }
 
-/// One camera's newest frame, refilled by its reader thread.
-struct Slot {
-    frame: Mutex<(Vec<u8>, u64, bool)>, // pixels, frame number, ended
-    fresh: Arc<(Mutex<u64>, Condvar)>,   // shared: counts frames from every camera
-}
-
-fn probe(url: &str) -> Res<(usize, usize)> {
-    let out = Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", url])
-        .output()?;
-    let s = String::from_utf8_lossy(&out.stdout);
-    let mut it = s.trim().lines().next().unwrap_or("").split(',');
-    match (it.next().and_then(|w| w.parse().ok()), it.next().and_then(|h| h.parse().ok())) {
-        (Some(w), Some(h)) => Ok((w, h)),
-        _ => Err("could not read the camera's picture size (ffprobe)".into()), // not the address: it can hold a password
-    }
-}
-
-fn spawn_reader(url: String, w: usize, h: usize, scale: bool, hwaccel: Option<String>, realtime: bool,
-                slot: Arc<Slot>) -> Res<()> {
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-nostdin", "-loglevel", "error"]);
-    if realtime {
-        cmd.arg("-re"); // a recording read at its own frame rate, as a camera would send it
-    }
-    if url.starts_with("rtsp") {
-        cmd.args(["-rtsp_transport", "tcp"]);
-    }
-    if let Some(hw) = &hwaccel {
-        cmd.args(["-hwaccel", hw]); // decode on the integrated GPU; detection stays on the CPU
-    }
-    cmd.args(["-i", &url, "-an"]);
-    if scale {
-        cmd.args(["-vf", &format!("scale={w}:{h}")]);
-    }
-    cmd.args(["-pix_fmt", "gray", "-f", "rawvideo", "-"]).stdout(Stdio::piped()).stderr(Stdio::inherit());
-    let mut child = cmd.spawn()?;
-    let mut out = child.stdout.take().unwrap();
-    std::thread::spawn(move || {
-        let mut buf = vec![0u8; w * h];
-        let mut n = 0u64;
-        while out.read_exact(&mut buf).is_ok() {
-            n += 1;
-            {
-                let mut f = slot.frame.lock().unwrap();
-                std::mem::swap(&mut f.0, &mut buf); // keep only the newest: a loop that falls behind skips frames
-                f.1 = n;
-            }
-            if buf.len() != w * h {
-                buf.resize(w * h, 0);
-            }
-            let (m, cv) = &*slot.fresh;
-            *m.lock().unwrap() += 1;
-            cv.notify_all();
+/// Log a camera's state when it changes: its name and host only, never its address.
+#[cfg(feature = "cameras")]
+fn log_changes(shared: &tamserve_boxes::runner::Shared, last: &mut HashMap<String, &'static str>) {
+    for (name, v) in shared.cameras.lock().unwrap().iter() {
+        let s = v.health.state().as_str();
+        if last.insert(name.clone(), s) != Some(s) {
+            let why = if s == "down" { format!(": {}", v.health.last_error()) } else { String::new() };
+            eprintln!("tamserve-boxes: camera {} is {s}{why}", v.label);
         }
-        slot.frame.lock().unwrap().2 = true;
-        let _ = child.kill();
-        let (m, cv) = &*slot.fresh;
-        *m.lock().unwrap() += 1;
-        cv.notify_all();
-    });
-    Ok(())
-}
-
-fn tracker_options(a: &Args) -> Res<TrackerOptions<String>> {
-    let every: u32 = a.num("look-every", 3)?;
-    let mut own = HashMap::new();
-    for spec in a.all("look") {
-        let (n, k) = spec.split_once('=').ok_or("--look NAME=K")?;
-        own.insert(n.to_string(), k.parse().map_err(|_| "--look NAME=K: K is not a number")?);
     }
-    Ok(TrackerOptions {
-        look_every: if own.is_empty() { LookEvery::All(every) } else { LookEvery::Each { cameras: own, default: every } },
-        hold: a.num("hold", 30)?,
-        ..Default::default()
-    })
 }
 
+#[cfg(feature = "cameras")]
 fn run(a: &Args) -> Res<()> {
-    let det = Detector::new(a.get("model").ok_or("--model is needed")?, detector_options(a)?)?;
-    let mut tracker = BoxTracker::new(det, tracker_options(a)?)?;
-    let fresh = Arc::new((Mutex::new(0u64), Condvar::new()));
-    let mut cams: Vec<(String, Arc<Slot>, usize, usize)> = Vec::new();
-    for spec in a.all("camera") {
-        let (name, url) = spec.split_once('=').ok_or("--camera NAME=URL")?;
-        let (w, h, scale) = match (a.get("width"), a.get("height")) {
-            (Some(w), Some(h)) => (w.parse()?, h.parse()?, true),
-            _ => { let (w, h) = probe(url)?; (w, h, false) }
-        };
-        let slot = Arc::new(Slot { frame: Mutex::new((vec![0; w * h], 0, false)), fresh: fresh.clone() });
-        spawn_reader(url.to_string(), w, h, scale, a.get("hwaccel").map(String::from), a.flag("realtime"), slot.clone())?;
-        cams.push((name.to_string(), slot, w, h));
-    }
+    use tamserve_boxes::{camera, config::Config, runner::Runner};
+    let path = a.get("config").ok_or("run --config cameras.toml (camera passwords live in the config, not on the command line)")?;
+    let (cfg, cams) = Config::load(path)?;
     if cams.is_empty() {
-        return Err("give at least one --camera NAME=URL".into());
+        return Err("the config has no [[camera]]".into());
     }
-    let mut seen = vec![0u64; cams.len()];
-    let mut copies: Vec<Vec<u8>> = cams.iter().map(|(_, _, w, h)| vec![0; w * h]).collect();
-    let start = Instant::now();
+    camera::init(cfg.decode.decoder)?;
+    let tracker = BoxTracker::from_model(&cfg.detector.model, cfg.detector_options(), cfg.tracker_options(&cams))?;
+    let mut runner = Runner::new(tracker, camera::Opening::from(&cfg.decode));
+    runner.set_cameras(&cams)?;
+    if let Some(l) = &cfg.http.listen {
+        let base = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));
+        let at = tamserve_boxes::http::serve(l, cfg.http_token(base)?, runner.shared.clone())?;
+        eprintln!("tamserve-boxes: metrics on http://{at}/metrics, status on /status, OpenAI-compatible on /v1/chat/completions");
+    }
+    let mut states = HashMap::new();
     let stdout = std::io::stdout();
     loop {
-        // Wait until some camera has a frame this loop has not seen, then take every camera's newest.
-        {
-            let (m, cv) = &*fresh;
-            let mut g = m.lock().unwrap();
-            let before = *g;
-            while *g == before {
-                g = cv.wait_timeout(g, Duration::from_secs(1)).unwrap().0;
-                if cams.iter().all(|(_, s, _, _)| s.frame.lock().unwrap().2) {
-                    return Ok(()); // every stream has ended
-                }
-            }
-        }
-        let mut batch = Vec::new();
-        for (i, (name, slot, _, _)) in cams.iter().enumerate() {
-            let f = slot.frame.lock().unwrap();
-            if f.1 > seen[i] {
-                seen[i] = f.1;
-                copies[i].copy_from_slice(&f.0);
-                batch.push(i);
-            }
-            let _ = name;
-        }
-        let frames: Vec<(String, GrayFrame)> = batch.iter()
-            .map(|&i| Ok((cams[i].0.clone(), GrayFrame::new(&copies[i], cams[i].2, cams[i].3)?)))
-            .collect::<Result<_, tamserve_boxes::Error>>()?;
-        let found = tracker.step(&frames)?;
-        let t = start.elapsed().as_secs_f64();
+        let reports = runner.step(Duration::from_millis(500))?;
+        log_changes(&runner.shared, &mut states);
         let mut out = stdout.lock();
-        for &i in &batch {
-            let name = &cams[i].0;
-            let objs: Vec<String> = found[name].iter().map(|(id, f)| {
-                format!("{{\"id\":{id},\"label\":{},\"score\":{:.3},\"box\":[{:.1},{:.1},{:.1},{:.1}]}}",
-                        json_str(&f.label), f.score, f.bbox[0], f.bbox[1], f.bbox[2], f.bbox[3])
-            }).collect();
-            writeln!(out, "{{\"t\":{t:.3},\"camera\":{},\"frame\":{},\"objects\":[{}]}}", json_str(name), seen[i], objs.join(","))?;
+        for r in &reports {
+            writeln!(out, "{}", serde_json::to_string(r)?)?;
         }
         out.flush()?;
+        if reports.is_empty() && runner.all_ended() {
+            log_changes(&runner.shared, &mut states);
+            return Ok(());
+        }
     }
+}
+
+#[cfg(not(feature = "cameras"))]
+fn run(_: &Args) -> Res<()> {
+    Err("this build has no `cameras` feature".into())
 }
 
 /// CPU seconds (user + system) and peak resident memory in bytes of a process, from /proc.
@@ -364,6 +274,7 @@ fn bench(a: &Args) -> Res<()> {
     let videos: Vec<Vec<Vec<u8>>> = (0..n).map(|c| synthetic(&picture, seed + c, 30)).collect();
     let mut opts = detector_options(a)?;
     opts.threads = Some(a.num("threads", 1)?);
+    opts.requests = a.num("requests", 1)?;
     let mut tracker: BoxTracker<Detector, usize> = BoxTracker::new(Detector::new(a.get("model").ok_or("--model")?, opts)?,
         TrackerOptions { look_every: LookEvery::All(a.num("look-every", 3)?), ..Default::default() })?;
     let frame = |c: usize, k: usize| GrayFrame::new(&videos[c][k % 30], 1280, 720);
@@ -396,11 +307,13 @@ fn bench(a: &Args) -> Res<()> {
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let result = match argv.first().map(|s| s.as_str()) {
-        Some(cmd @ ("fold" | "detect" | "run" | "bench")) => {
-            Args::parse(&argv[1..], &["separate", "realtime"]).and_then(|a| match cmd {
+        Some(cmd @ ("fold" | "detect" | "run" | "bench" | "box" | "coordinator")) => {
+            Args::parse(&argv[1..], &["separate"]).and_then(|a| match cmd {
                 "fold" => fold(&a),
                 "detect" => detect(&a),
                 "run" => run(&a),
+                "box" => run_box(&a),
+                "coordinator" => coordinator(&a),
                 _ => bench(&a),
             })
         }
@@ -409,5 +322,156 @@ fn main() {
     if let Err(e) = result {
         eprintln!("tamserve-boxes: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(feature = "cameras")]
+fn run_box(a: &Args) -> Res<()> {
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use tamserve_boxes::coord::{self, CameraHealth, Channel, FromBox, FromCoordinator};
+    use tamserve_boxes::{camera, config::Config, runner::Runner};
+
+    let path = a.get("config").ok_or("box --config cameras.toml")?;
+    let (cfg, cams) = Config::load(path)?;
+    let token = coord::read_token(std::path::Path::new(a.get("token-file").ok_or("--token-file is needed")?))?;
+    let addr = a.get("coordinator").ok_or("--coordinator HOST:PORT is needed")?.to_string();
+    let name = a.get("name").ok_or("--name is needed: what the coordinator calls this box")?.to_string();
+    let capacity: f64 = a.num("capacity", cams.iter().map(|c| c.weight).sum::<f64>())?;
+    camera::init(cfg.decode.decoder)?;
+    let tracker = BoxTracker::from_model(&cfg.detector.model, cfg.detector_options(), cfg.tracker_options(&cams))?;
+    let mut runner = Runner::new(tracker, camera::Opening::from(&cfg.decode));
+    let shared = runner.shared.clone();
+    if let Some(l) = &cfg.http.listen {
+        let base = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));
+        let at = tamserve_boxes::http::serve(l, cfg.http_token(base)?, shared.clone())?;
+        eprintln!("tamserve-boxes box {name}: metrics on http://{at}/metrics");
+    }
+    let (assign_tx, assign_rx) = mpsc::channel::<Vec<String>>();
+    let (report_tx, report_rx) = mpsc::sync_channel::<Vec<serde_json::Value>>(256);
+    let known: Vec<String> = cams.iter().map(|c| c.name.clone()).collect();
+
+    // The link to the coordinator, kept up with backoff. The box keeps serving its cameras
+    // while the coordinator is away, so a coordinator outage does not stop the analytics.
+    {
+        let (name, shared) = (name.clone(), shared.clone());
+        std::thread::Builder::new().name("coordinator link".into()).spawn(move || {
+            let backoff = camera::Backoff { first: 1.0, max: 30.0 };
+            let mut failures = 0u32;
+            loop {
+                let ch = Channel::connect(&addr, &token, &name).and_then(|mut ch| {
+                    ch.send(&FromBox::Hello { protocol: coord::PROTOCOL.into(), capacity, known: known.clone() })?;
+                    Ok(ch)
+                });
+                let mut ch = match ch {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("tamserve-boxes box {name}: cannot reach the coordinator: {e}");
+                        std::thread::sleep(backoff.delay(failures));
+                        failures = failures.saturating_add(1);
+                        continue;
+                    }
+                };
+                eprintln!("tamserve-boxes box {name}: joined the coordinator");
+                failures = 0;
+                let Ok(mut writer) = ch.split() else { continue };
+                let _ = ch.set_read_timeout(Some(Duration::from_secs(10)));
+                let (dead_tx, dead_rx) = mpsc::channel::<String>();
+                let tx = assign_tx.clone();
+                std::thread::spawn(move || loop {
+                    match ch.recv::<FromCoordinator>() {
+                        Ok(FromCoordinator::Assign { cameras }) => { let _ = tx.send(cameras); }
+                        Ok(FromCoordinator::Ping) => {}
+                        Ok(FromCoordinator::Refused { reason }) => { let _ = dead_tx.send(format!("refused: {reason}")); ch.shutdown(); break; }
+                        Err(e) => { let _ = dead_tx.send(e.to_string()); ch.shutdown(); break; }
+                    }
+                });
+                let mut last_us = shared.step_us_total.load(Ordering::Relaxed);
+                let mut last_t = Instant::now();
+                let why = 'session: loop {
+                    let tick = Instant::now() + Duration::from_secs(1);
+                    while Instant::now() < tick {
+                        if let Ok(why) = dead_rx.try_recv() {
+                            break 'session why;
+                        }
+                        match report_rx.recv_timeout(Duration::from_millis(100)) {
+                            Ok(mut batch) => {
+                                while let Ok(more) = report_rx.try_recv() {
+                                    batch.extend(more);
+                                }
+                                if let Err(e) = writer.send(&FromBox::Reports { reports: batch }) {
+                                    break 'session e.to_string();
+                                }
+                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
+                    }
+                    let us = shared.step_us_total.load(Ordering::Relaxed);
+                    let busy = (us - last_us) as f64 / 1e6 / last_t.elapsed().as_secs_f64();
+                    (last_us, last_t) = (us, Instant::now());
+                    let cameras = shared.cameras.lock().unwrap().iter().map(|(n, v)| CameraHealth {
+                        name: n.clone(), state: v.health.state().as_str().into(), frame_age_seconds: v.health.frame_age(),
+                        frames_decoded: v.health.decoded.load(Ordering::Relaxed), reconnects: v.health.reconnects.load(Ordering::Relaxed),
+                    }).collect();
+                    if let Err(e) = writer.send(&FromBox::Heartbeat { cameras, busy: busy.min(1.0) }) {
+                        break 'session e.to_string();
+                    }
+                };
+                writer.shutdown();
+                eprintln!("tamserve-boxes box {name}: lost the coordinator ({why}); still serving its cameras, reconnecting");
+            }
+        })?;
+    }
+
+    let mut states = HashMap::new();
+    loop {
+        let mut wanted = None;
+        while let Ok(w) = assign_rx.try_recv() {
+            wanted = Some(w); // only the newest assignment matters
+        }
+        if let Some(w) = wanted {
+            let set: Vec<_> = cams.iter().filter(|c| w.contains(&c.name)).cloned().collect();
+            let (opened, closed) = runner.set_cameras(&set)?;
+            if !opened.is_empty() || !closed.is_empty() {
+                eprintln!("tamserve-boxes box {name}: now serving {:?} (opened {opened:?}, closed {closed:?})", runner.cameras());
+            }
+        }
+        let reports = runner.step(Duration::from_millis(200))?;
+        log_changes(&runner.shared, &mut states);
+        if !reports.is_empty() {
+            let batch = reports.iter().filter_map(|r| serde_json::to_value(r).ok()).collect();
+            let _ = report_tx.try_send(batch); // a full queue drops results rather than stall the cameras
+        }
+    }
+}
+
+#[cfg(not(feature = "cameras"))]
+fn run_box(_: &Args) -> Res<()> {
+    Err("this build has no `cameras` feature".into())
+}
+
+fn coordinator(a: &Args) -> Res<()> {
+    use tamserve_boxes::coord::{read_token, CoordConfig, Coordinator};
+    let path = a.get("config").ok_or("coordinator --config coordinator.toml")?;
+    let cfg: CoordConfig = toml::from_str(&std::fs::read_to_string(path)?).map_err(|e| format!("{path}: {e}"))?;
+    let base = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+    let abs = |p: &std::path::Path| if p.is_relative() { base.join(p) } else { p.to_path_buf() };
+    let token = read_token(&abs(&cfg.token_file))?;
+    let http = cfg.http.clone();
+    let http_token = match &cfg.http_token_file {
+        Some(t) => Some(String::from_utf8(read_token(&abs(t))?)?),
+        None => None,
+    };
+    let n = cfg.cameras.len();
+    let c = Coordinator::new(cfg, Box::new(std::io::stdout()))?;
+    let at = c.serve(token)?;
+    eprintln!("tamserve-boxes coordinator: {n} cameras; boxes connect to {at}");
+    if let Some(l) = http {
+        let h = tamserve_boxes::http::serve(&l, http_token, c.clone())?;
+        eprintln!("tamserve-boxes coordinator: metrics on http://{h}/metrics, status on /status");
+    }
+    loop {
+        std::thread::park();
     }
 }

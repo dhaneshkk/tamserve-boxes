@@ -81,6 +81,7 @@ pub struct BoxTracker<D: Detect = Detector, K: Eq + Hash + Clone = String> {
     pub opts: TrackerOptions<K>,
     cameras: HashMap<K, Camera>,
     joined: u32, // cameras that have had their first look
+    looks: u64,  // frames the detector has been given
 }
 
 /// box index -> track index, one to one, the best overlap first, down to `least`.
@@ -141,7 +142,12 @@ impl<K: Eq + Hash + Clone> BoxTracker<Detector, K> {
 impl<D: Detect, K: Eq + Hash + Clone> BoxTracker<D, K> {
     pub fn new(detector: D, opts: TrackerOptions<K>) -> Result<Self> {
         opts.look_every.check()?;
-        Ok(BoxTracker { detector, opts, cameras: HashMap::new(), joined: 0 })
+        Ok(BoxTracker { detector, opts, cameras: HashMap::new(), joined: 0, looks: 0 })
+    }
+
+    /// Frames the detector has been given so far.
+    pub fn looks(&self) -> u64 {
+        self.looks
     }
 
     /// Forget a camera.
@@ -185,6 +191,7 @@ impl<D: Detect, K: Eq + Hash + Clone> BoxTracker<D, K> {
         let pictures: Vec<GrayFrame> = looking.iter()
             .map(|c| frames.iter().find(|(k, _)| k == c).unwrap().1)
             .collect();
+        self.looks += pictures.len() as u64;
         let found = self.detector.detect(&pictures)?;
         for (c, finds) in looking.iter().zip(found) {
             let every = self.opts.look_every.of(c);
