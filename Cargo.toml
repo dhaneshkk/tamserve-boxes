@@ -1,0 +1,21 @@
+[package]
+name = "tamserve-boxes"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Find and follow boxes on many cameras with YOLOX-Nano on gray frames, on the CPU through OpenVINO: the Rust port of tamserve.boxes."
+repository = "https://github.com/dhaneshkk/tamserve"
+
+[features]
+# fold: make the 1-channel model from YOLOX's own ONNX file (tamserve-boxes fold). Not needed to run one.
+fold = ["dep:onnx-protobuf", "dep:protobuf"]
+default = ["fold"]
+
+[dependencies]
+# OpenVINO's C library is loaded at run time: put its folder on LD_LIBRARY_PATH or set OPENVINO_INSTALL_DIR.
+openvino = { version = "0.11.1", features = ["runtime-linking"] }
+onnx-protobuf = { version = "0.2.3", optional = true }  # MPL-2.0
+protobuf = { version = "=3.4.0", optional = true }  # the version onnx-protobuf's generated code was made with
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
