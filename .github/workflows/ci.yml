@@ -15,10 +15,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: GStreamer
-        timeout-minutes: 8   # a stuck package mirror fails fast instead of holding the runner for hours
+        timeout-minutes: 8   # a stuck package mirror or lock fails fast instead of holding the runner for hours
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update -qq -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::ForceIPv4=true
-          sudo apt-get install -y -qq -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::ForceIPv4=true libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+          # -q, not -qq, so a stall shows where it is. Wait at most 2 min for the dpkg lock that the runner's
+          # own background updates can hold, retry slow mirrors, and never prompt.
+          apt="sudo -E apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::ForceIPv4=true -o DPkg::Lock::Timeout=120"
+          time $apt update
+          time $apt install -y --no-install-recommends libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
       - name: OpenVINO's C library (from the pip wheel, under the name the bindings look for)
         run: |
