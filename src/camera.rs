@@ -10,7 +10,18 @@
 //! `Decoder::Vaapi` ranks GStreamer's VA-API decoders first, so H.264 and H.265 are
 //! decoded on the integrated GPU; `Decoder::Software` ranks them out. Either way the
 //! frames come back to the CPU for detection.
+//!
+//! A camera that records or is watched live is read once and its stream shared:
+//! `urisourcebin ! parsebin ! h264parse|h265parse ! tee`, and from the tee
+//! - `queue ! decodebin3 ! videoconvert ! videoscale ! appsink`: the gray frames, as above;
+//! - `queue ! splitmuxsink(mpegtsmux)`: `segment_seconds` MPEG-TS segments, cut on
+//!   keyframes, never decoded or encoded (see [`crate::retention`]);
+//! - `queue ! mpegtsmux ! appsink`: the live stream, on a [`Tap`] (see [`crate::restream`]).
+//!
+//! MPEG-TS, not MP4, so that a segment cut short by a power cut still plays. Recording
+//! and live view need H.264 or H.265; other streams (MJPEG) are only decoded.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -22,6 +33,7 @@ use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
 
 use crate::config::{Camera, DecodeSection, Decoder};
+use crate::restream::Tap;
 use crate::{Error, Result};
 
 /// Where a camera stands.
@@ -81,6 +93,16 @@ pub struct Health {
     pub generation: AtomicU64,
     pub width: AtomicU64,
     pub height: AtomicU64,
+    /// Recorded segments started.
+    pub segments: AtomicU64,
+    /// Steps on which motion was seen (when `[motion]` is on).
+    pub motion_steps: AtomicU64,
+    /// Looks not made because the camera was quiet with nothing followed.
+    pub looks_skipped: AtomicU64,
+    /// Times the whole picture changed at once (the light) and motion started over.
+    pub lighting_resets: AtomicU64,
+    /// 1 while motion is held open.
+    pub moving: AtomicBool,
     last_error: Mutex<String>,
 }
 
@@ -94,7 +116,7 @@ impl Health {
     pub fn last_error(&self) -> String {
         self.last_error.lock().unwrap().clone()
     }
-    fn fail(&self, why: String) {
+    pub(crate) fn fail(&self, why: String) {
         *self.last_error.lock().unwrap() = why;
     }
     /// Seconds since the newest frame, if there has been one.
@@ -167,6 +189,14 @@ pub struct Opening {
     pub stall: Duration,
     pub backoff: Backoff,
     pub realtime: bool,
+    /// Where cameras with `record = true` write their segments, and how long each is.
+    pub record: Option<RecordTo>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecordTo {
+    pub dir: PathBuf,
+    pub segment: Duration,
 }
 
 impl From<&DecodeSection> for Opening {
@@ -179,6 +209,7 @@ impl From<&DecodeSection> for Opening {
             stall: Duration::from_secs_f64(d.stall_seconds.unwrap_or(10.0)),
             backoff: Backoff { first: d.backoff_first.unwrap_or(1.0), max: d.backoff_max.unwrap_or(30.0) },
             realtime: d.realtime,
+            record: None,
         }
     }
 }
@@ -231,6 +262,8 @@ fn is_live(uri: &str) -> bool {
 pub struct Source {
     pub camera: Camera,
     pub health: Arc<Health>,
+    /// The live stream, for a camera with `live = true`.
+    pub live: Option<Arc<Tap>>,
     newest: Arc<Mutex<Option<Frame>>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -243,12 +276,21 @@ impl Source {
         let health = Arc::new(Health::default());
         let newest = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
-        let (h, n, s, cam, how) = (health.clone(), newest.clone(), stop.clone(), camera.clone(), how.clone());
+        if camera.record && how.record.is_none() {
+            return Err(Error::Invalid(format!("camera {:?} has record = true, but the config has no [record] dir", camera.name)));
+        }
+        let live = camera.live.then(|| Arc::new(Tap::new(512, 8)));
+        let (h, n, s, cam, how, l) = (health.clone(), newest.clone(), stop.clone(), camera.clone(), how.clone(), live.clone());
         let thread = std::thread::Builder::new()
             .name(format!("camera {}", camera.name))
-            .spawn(move || supervise(&cam, &target, &how, &h, &n, &s, &bell))
+            .spawn(move || supervise(&cam, &target, &how, &h, &n, &s, &bell, l.as_ref()))
             .map_err(Error::Io)?;
-        Ok(Source { camera, health, newest, stop, thread: Some(thread) })
+        Ok(Source { camera, health, live, newest, stop, thread: Some(thread) })
+    }
+
+    /// Tell its thread to stop, without waiting for it (dropping the source waits).
+    pub fn stop_soon(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 
     /// The newest frame not yet taken, if any.
@@ -269,14 +311,15 @@ impl Drop for Source {
 
 /// Keep `camera` open until told to stop: open, read, and on failure or a stall wait
 /// the backoff and open again. A file is read once.
+#[allow(clippy::too_many_arguments)]
 fn supervise(camera: &Camera, target: &str, how: &Opening, health: &Arc<Health>, newest: &Arc<Mutex<Option<Frame>>>,
-             stop: &AtomicBool, bell: &Arc<Bell>) {
+             stop: &AtomicBool, bell: &Arc<Bell>, live: Option<&Arc<Tap>>) {
     let mut failures = 0u32;
     while !stop.load(Ordering::Relaxed) {
         health.set(State::Connecting);
         health.generation.fetch_add(1, Ordering::Relaxed);
         let opened = Instant::now();
-        let outcome = stream(camera, target, how, health, newest, stop, bell);
+        let outcome = stream(camera, target, how, health, newest, stop, bell, live);
         health.up_since_ms.store(0, Ordering::Relaxed);
         match outcome {
             Outcome::Stopped => break,
@@ -314,52 +357,227 @@ fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// The RTSP settings and the credentials, set on the source element as properties.
+fn on_source_setup(src: &gst::Element, camera: &Camera, how: &Opening) {
+    let (user, pw, tcp) = (camera.user.clone(), camera.password.clone(), how.tcp);
+    src.connect("source-setup", false, move |args| {
+        if let Ok(el) = args[1].get::<gst::Element>() {
+            if el.find_property("user-id").is_some() {
+                if let Some(u) = &user {
+                    el.set_property("user-id", u);
+                }
+                if let Some(p) = &pw {
+                    el.set_property("user-pw", p);
+                }
+            }
+            if el.find_property("protocols").is_some() && tcp {
+                el.set_property_from_str("protocols", "tcp");
+            }
+            if el.find_property("latency").is_some() {
+                el.set_property("latency", 200u32);
+            }
+            if el.find_property("timeout").is_some() && el.find_property("tcp-timeout").is_some() {
+                el.set_property("tcp-timeout", 10_000_000u64); // µs: a connection attempt gives up after 10 s
+            }
+        }
+        None
+    });
+}
+
+/// The decoding end: `queue ! decodebin3`, whose video is linked when it appears to a bin
+/// `videoconvert ! videoscale ! caps ! appsink`. Returns the queue, to feed, and the sink.
+fn decoder(pipeline: &gst::Pipeline, caps: &str, sync: bool) -> std::result::Result<(gst::Element, gst_app::AppSink), String> {
+    let tail = gst::parse::bin_from_description(&format!("videoconvert ! videoscale ! {caps} ! \
+        appsink name=sink max-buffers=1 drop=true sync={sync} enable-last-sample=false"), true)
+        .map_err(|e| format!("could not build the decoder: {e}"))?;
+    let sink = tail.by_name("sink").and_then(|s| s.downcast::<gst_app::AppSink>().ok()).ok_or("no appsink")?;
+    let q = gst::ElementFactory::make("queue").property("max-size-time", 2_000_000_000u64)
+        .property("max-size-buffers", 0u32).property("max-size-bytes", 0u32).build().map_err(|e| e.to_string())?;
+    let dec = element("decodebin3")?;
+    pipeline.add_many([&q, &dec, tail.upcast_ref()]).map_err(|e| e.to_string())?;
+    q.link(&dec).map_err(|e| e.to_string())?;
+    let into = tail.static_pad("sink").ok_or("the decoder has no sink pad")?;
+    dec.connect_pad_added(move |_, pad| {
+        if !into.is_linked() && pad.current_caps().or_else(|| Some(pad.query_caps(None)))
+            .is_some_and(|c| c.structure(0).is_some_and(|s| s.name().starts_with("video/"))) {
+            let _ = pad.link(&into);
+        }
+    });
+    Ok((q, sink))
+}
+
+fn element(factory: &str) -> std::result::Result<gst::Element, String> {
+    gst::ElementFactory::make(factory).build().map_err(|_| format!("GStreamer has no {factory}: install its plugins"))
+}
+
+/// The shared pipeline: one source, parsed once, teed to the decoder, the recorder and
+/// the live stream. Its parsebin's first video stream is linked when it appears.
+fn shared_pipeline(camera: &Camera, target: &str, how: &Opening, caps: &str, sync: bool, health: &Arc<Health>,
+                   live: Option<&Arc<Tap>>) -> std::result::Result<(gst::Pipeline, gst_app::AppSink), String> {
+    let pipeline = gst::Pipeline::new();
+    let src = gst::ElementFactory::make("urisourcebin").property("uri", target).build()
+        .map_err(|_| "GStreamer has no urisourcebin".to_string())?;
+    on_source_setup(&src, camera, how);
+    let parse = element("parsebin")?;
+    pipeline.add_many([&src, &parse]).map_err(|e| e.to_string())?;
+    // Added now, in the NULL state, and started with the pipeline: fed once the stream is known.
+    let (decoded, sink) = decoder(&pipeline, caps, sync)?;
+
+    // The source's first stream that is not audio goes to parsebin; any others are dropped.
+    let parse_in = parse.static_pad("sink").ok_or("parsebin has no sink pad")?;
+    let p = pipeline.downgrade();
+    src.connect_pad_added(move |_, pad| {
+        let Some(pipeline) = p.upgrade() else { return };
+        let audio = pad.current_caps().or_else(|| Some(pad.query_caps(None)))
+            .and_then(|c| c.structure(0).map(|s| s.get::<&str>("media").is_ok_and(|m| m == "audio")))
+            .unwrap_or(false);
+        if !audio && !parse_in.is_linked() && pad.link(&parse_in).is_ok() {
+            return;
+        }
+        if let Ok(f) = element("fakesink") {
+            let _ = pipeline.add(&f);
+            let _ = f.sync_state_with_parent();
+            let _ = pad.link(&f.static_pad("sink").unwrap());
+        }
+    });
+
+    let record = if camera.record { how.record.clone() } else { None };
+    let (p, name, h, live, linked) = (pipeline.downgrade(), camera.name.clone(), health.clone(), live.cloned(), Arc::new(AtomicBool::new(false)));
+    parse.connect_pad_added(move |_, pad| {
+        let Some(pipeline) = p.upgrade() else { return };
+        let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
+        let kind = caps.structure(0).map(|s| s.name().to_string()).unwrap_or_default();
+        let drop_it = |pad: &gst::Pad| {
+            if let Ok(f) = element("fakesink") {
+                let _ = pipeline.add(&f);
+                let _ = f.sync_state_with_parent();
+                let _ = pad.link(&f.static_pad("sink").unwrap());
+            }
+        };
+        if !kind.starts_with("video/") || linked.swap(true, Ordering::SeqCst) {
+            return drop_it(pad);
+        }
+        let result = (|| -> std::result::Result<(), String> {
+            let codec = match kind.as_str() {
+                "video/x-h264" => Some(("h264parse", "video/x-h264")),
+                "video/x-h265" => Some(("h265parse", "video/x-h265")),
+                _ => None,
+            };
+            let Some((parser, media)) = codec else {
+                // Not H.264 or H.265: decoded for detection only.
+                if record.is_some() || live.is_some() {
+                    h.fail(format!("{kind} can be followed but not recorded or watched live: that needs H.264 or H.265"));
+                }
+                return pad.link(&decoded.static_pad("sink").unwrap()).map(|_| ()).map_err(|e| e.to_string());
+            };
+            let parser = element(parser)?;
+            // The stream's parameter sets before every keyframe: each segment, and a viewer
+            // who joins mid-stream, can be decoded from its first keyframe on its own.
+            parser.set_property("config-interval", -1i32);
+            let byte_stream = gst::Caps::builder(media).field("stream-format", "byte-stream").field("alignment", "au").build();
+            let filter = gst::ElementFactory::make("capsfilter").property("caps", &byte_stream).build().map_err(|e| e.to_string())?;
+            let tee = element("tee")?;
+            pipeline.add_many([&parser, &filter, &tee]).map_err(|e| e.to_string())?;
+            gst::Element::link_many([&parser, &filter, &tee]).map_err(|e| e.to_string())?;
+            let branch = |to: &gst::Element, leaky: bool| -> std::result::Result<(), String> {
+                let q = gst::ElementFactory::make("queue").property("max-size-time", 2_000_000_000u64)
+                    .property("max-size-buffers", 0u32).property("max-size-bytes", 0u32).build().map_err(|e| e.to_string())?;
+                if leaky {
+                    q.set_property_from_str("leaky", "downstream");
+                }
+                pipeline.add(&q).map_err(|e| e.to_string())?;
+                q.link(to).map_err(|e| e.to_string())?;
+                tee.link(&q).map_err(|e| e.to_string())?;
+                q.sync_state_with_parent().map_err(|e| e.to_string())
+            };
+            // The decoder's queue is already there; the tee feeds it directly.
+            tee.link(&decoded).map_err(|e| e.to_string())?;
+            if let Some(rec) = &record {
+                let dir = rec.dir.join(&name);
+                crate::retention::private_dir(&dir).map_err(|e| format!("cannot record to {}: {e}", dir.display()))?;
+                let split = gst::ElementFactory::make("splitmuxsink")
+                    .property("max-size-time", rec.segment.as_nanos() as u64)
+                    .property("muxer-factory", "mpegtsmux")
+                    .property("async-finalize", false)
+                    // Whole 7-packet writes through a 16 KB buffer: a crash loses at most that
+                    // much of the open segment (what the kernel has not written yet aside).
+                    .property("muxer-properties", gst::Structure::builder("properties").field("alignment", 7i32).build())
+                    .property("sink-properties", gst::Structure::builder("properties").field("buffer-size", 16_384u32).build())
+                    .build().map_err(|_| "GStreamer has no splitmuxsink (gstreamer1.0-plugins-good)".to_string())?;
+                let h2 = h.clone();
+                // Each segment is named by when it starts, in ms since 1970.
+                split.connect("format-location", false, move |_| {
+                    h2.segments.fetch_add(1, Ordering::Relaxed);
+                    Some(dir.join(format!("{}.ts", now_ms())).to_string_lossy().to_string().to_value())
+                });
+                pipeline.add(&split).map_err(|e| e.to_string())?;
+                split.sync_state_with_parent().map_err(|e| e.to_string())?;
+                branch(&split, false)?;
+            }
+            if let Some(tap) = &live {
+                let mux = gst::ElementFactory::make("mpegtsmux").property("alignment", 7i32).build()
+                    .map_err(|_| "GStreamer has no mpegtsmux (gstreamer1.0-plugins-bad)".to_string())?;
+                let out = gst_app::AppSink::builder().sync(false).max_buffers(64).drop(false).build();
+                let tap = tap.clone();
+                out.set_callbacks(gst_app::AppSinkCallbacks::builder().new_sample(move |s| {
+                    let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    if let Some(map) = sample.buffer().and_then(|b| b.map_readable().ok()) {
+                        tap.publish(map.as_slice());
+                    }
+                    Ok(gst::FlowSuccess::Ok)
+                }).build());
+                pipeline.add_many([&mux, out.upcast_ref()]).map_err(|e| e.to_string())?;
+                mux.link(&out).map_err(|e| e.to_string())?;
+                mux.sync_state_with_parent().map_err(|e| e.to_string())?;
+                out.sync_state_with_parent().map_err(|e| e.to_string())?;
+                branch(&mux, true)?;
+            }
+            for e in [&parser, &filter, &tee] {
+                e.sync_state_with_parent().map_err(|e| e.to_string())?;
+            }
+            pad.link(&parser.static_pad("sink").unwrap()).map(|_| ()).map_err(|e| e.to_string())
+        })();
+        if let Err(e) = result {
+            // Posted as an error: the bus loop fails the connection and it is tried again.
+            let _ = pipeline.post_message(gst::message::Error::builder(gst::CoreError::Negotiation, &e).build());
+        }
+    });
+    Ok((pipeline, sink))
+}
+
+/// The pipeline of a camera that is only followed: `uridecodebin ! ... ! appsink`.
+fn simple_pipeline(camera: &Camera, target: &str, how: &Opening, caps: &str, sync: bool)
+                   -> std::result::Result<(gst::Pipeline, gst_app::AppSink), String> {
+    let desc = format!("uridecodebin name=src uri={} ! videoconvert ! videoscale ! {caps} ! \
+                        appsink name=sink max-buffers=1 drop=true sync={sync} enable-last-sample=false",
+                       quote(target));
+    let pipeline = gst::parse::launch(&desc).map_err(|e| format!("could not build the pipeline: {e}"))?
+        .downcast::<gst::Pipeline>().map_err(|_| "not a pipeline".to_string())?;
+    if let Some(src) = pipeline.by_name("src") {
+        on_source_setup(&src, camera, how);
+    }
+    let sink = pipeline.by_name("sink").and_then(|s| s.downcast::<gst_app::AppSink>().ok()).ok_or("no appsink")?;
+    Ok((pipeline, sink))
+}
+
 /// One connection, until it ends, fails, stalls or is stopped.
+#[allow(clippy::too_many_arguments)]
 fn stream(camera: &Camera, target: &str, how: &Opening, health: &Arc<Health>, newest: &Arc<Mutex<Option<Frame>>>,
-          stop: &AtomicBool, bell: &Arc<Bell>) -> Outcome {
+          stop: &AtomicBool, bell: &Arc<Bell>, live: Option<&Arc<Tap>>) -> Outcome {
     let mut caps = "video/x-raw,format=(string){GRAY8,NV12,I420,YV12,NV21}".to_string();
     if let (Some(w), Some(h)) = (how.width, how.height) {
         caps += &format!(",width={w},height={h}");
     }
     let sync = how.realtime || !is_live(target);
-    let desc = format!("uridecodebin name=src uri={} ! videoconvert ! videoscale ! {caps} ! \
-                        appsink name=sink max-buffers=1 drop=true sync={sync} enable-last-sample=false",
-                       quote(target));
-    let pipeline = match gst::parse::launch(&desc) {
-        Ok(p) => match p.downcast::<gst::Pipeline>() {
-            Ok(p) => p,
-            Err(_) => return Outcome::Failed("not a pipeline".into()),
-        },
-        Err(e) => return Outcome::Failed(format!("could not build the pipeline: {e}")),
+    let shared = (camera.record && how.record.is_some()) || live.is_some();
+    let built = if shared {
+        shared_pipeline(camera, target, how, &caps, sync, health, live)
+    } else {
+        simple_pipeline(camera, target, how, &caps, sync)
     };
-    // Credentials and RTSP settings go onto the source element as properties.
-    if let Some(src) = pipeline.by_name("src") {
-        let (user, pw, tcp) = (camera.user.clone(), camera.password.clone(), how.tcp);
-        src.connect("source-setup", false, move |args| {
-            if let Ok(el) = args[1].get::<gst::Element>() {
-                if el.find_property("user-id").is_some() {
-                    if let Some(u) = &user {
-                        el.set_property("user-id", u);
-                    }
-                    if let Some(p) = &pw {
-                        el.set_property("user-pw", p);
-                    }
-                }
-                if el.find_property("protocols").is_some() && tcp {
-                    el.set_property_from_str("protocols", "tcp");
-                }
-                if el.find_property("latency").is_some() {
-                    el.set_property("latency", 200u32);
-                }
-                if el.find_property("timeout").is_some() && el.find_property("tcp-timeout").is_some() {
-                    el.set_property("tcp-timeout", 10_000_000u64); // µs: a connection attempt gives up after 10 s
-                }
-            }
-            None
-        });
-    }
-    let Some(sink) = pipeline.by_name("sink").and_then(|s| s.downcast::<gst_app::AppSink>().ok()) else {
-        return Outcome::Failed("no appsink".into());
+    let (pipeline, sink) = match built {
+        Ok(b) => b,
+        Err(e) => return Outcome::Failed(e),
     };
     let generation = health.generation.load(Ordering::Relaxed);
     let (h, n, b) = (health.clone(), newest.clone(), bell.clone());
@@ -427,6 +645,18 @@ fn stream(camera: &Camera, target: &str, how: &Opening, health: &Arc<Health>, ne
             break Outcome::Failed(format!("no frame for {:.0} s", quiet.as_secs_f64()));
         }
     };
+    if shared && matches!(outcome, Outcome::Stopped) {
+        finish(&pipeline, &bus);
+    }
     let _ = pipeline.set_state(gst::State::Null);
     outcome
+}
+
+/// End a shared pipeline cleanly when it is stopped: an end of stream down every branch,
+/// so the recorder closes its open segment whole. Waits at most 3 s for it.
+fn finish(pipeline: &gst::Pipeline, bus: &gst::Bus) {
+    if !pipeline.send_event(gst::event::Eos::new()) {
+        return;
+    }
+    let _ = bus.timed_pop_filtered(gst::ClockTime::from_seconds(3), &[gst::MessageType::Eos, gst::MessageType::Error]);
 }

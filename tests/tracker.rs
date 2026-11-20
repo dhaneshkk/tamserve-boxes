@@ -149,3 +149,124 @@ fn bad_settings_are_rejected() {
     assert!(BoxTracker::new(scripted(|_, _| vec![]), each).is_err());
     assert!(GrayFrame::new(&[0u8; 10], 4, 4).is_err());
 }
+
+/// Steps with a gate: `quiet(camera, step)`. Returns each step's ids for camera 1.
+fn run_gated<D: Detect>(t: &mut BoxTracker<D, u8>, steps: u8, cams: &[u8], quiet: impl Fn(u8, u8) -> bool) -> Vec<Vec<u32>> {
+    (0..steps).map(|k| {
+        let pixels: Vec<Vec<u8>> = cams.iter().map(|&c| frame(c, k, 120)).collect();
+        let frames: Vec<(u8, GrayFrame)> = cams.iter().zip(&pixels).map(|(&c, p)| (c, GrayFrame::new(p, 200, 120).unwrap())).collect();
+        let out = t.step_gated(&frames, &|c| quiet(*c, k)).unwrap();
+        out[&1].keys().copied().collect()
+    }).collect()
+}
+
+#[test]
+fn a_gate_that_is_never_quiet_changes_nothing() {
+    let finds = |cam: u8, step: u8| if cam == 1 && step < 9 { vec![(walk(step), 0.9, 0)] } else { vec![] };
+    let mut plain = BoxTracker::new(scripted(finds), opts(3, 4)).unwrap();
+    let mut gated = BoxTracker::new(scripted(finds), opts(3, 4)).unwrap();
+    let want: Vec<Vec<u32>> = run(&mut plain, 20, &[1, 2]).into_iter().map(|m| m[&1].clone()).collect();
+    assert_eq!(run_gated(&mut gated, 20, &[1, 2], |_, _| false), want);
+    assert_eq!(plain.detector.looks, gated.detector.looks);
+}
+
+#[test]
+fn a_quiet_camera_with_nothing_followed_is_not_looked_at() {
+    // Nothing is ever there; the camera is quiet from step 2 on, and moves at step 12.
+    let mut t = BoxTracker::new(scripted(|_, _| vec![]), opts(1, 4)).unwrap();
+    run_gated(&mut t, 16, &[1], |_, k| (2..12).contains(&k));
+    let looked: Vec<usize> = t.detector.looks.iter().map(|l| l.len()).collect();
+    assert_eq!(looked.len(), 16);
+    assert_eq!(looked.iter().sum::<usize>(), 6, "looks only on steps 0, 1 and 12 to 15: {looked:?}");
+    assert!(looked[2..12].iter().all(|&n| n == 0));
+}
+
+#[test]
+fn a_quiet_camera_still_follows_what_it_has() {
+    // A person stands still (no motion) from step 3: they are followed while seen, and
+    // only once they are gone and held out does the gate stop the looks.
+    let finds = |_: u8, step: u8| if step < 8 { vec![([50.0, 30.0, 80.0, 100.0], 0.9, 0)] } else { vec![] };
+    let mut t = BoxTracker::new(scripted(finds), opts(1, 3)).unwrap();
+    let ids = run_gated(&mut t, 20, &[1], |_, k| k >= 3);
+    assert!(ids[..8].iter().all(|i| i == &vec![1]), "{ids:?}");
+    let looked: Vec<usize> = t.detector.looks.iter().map(|l| l.len()).collect();
+    // Seen up to step 7; held unseen through step 11 (hold 3 + the step it is dropped on); then quiet.
+    assert!(looked[..12].iter().all(|&n| n == 1), "{looked:?}");
+    assert!(looked[12..].iter().all(|&n| n == 0), "{looked:?}");
+    assert_eq!(t.skipped(), &[1]);
+}
+
+/// Stands in for a Detector that finds the bright (255) rectangle on each picture it is
+/// given, in that picture's own pixels, and keeps the sizes it was given.
+struct Bright {
+    names: Vec<String>,
+    sizes: Vec<Vec<(usize, usize)>>,
+}
+
+impl Detect for Bright {
+    fn names(&self) -> &[String] {
+        &self.names
+    }
+    fn detect(&mut self, frames: &[GrayFrame]) -> Result<Vec<Finds>> {
+        self.sizes.push(frames.iter().map(|f| (f.width, f.height)).collect());
+        Ok(frames.iter().map(|f| {
+            let (mut b, mut any) = ([f32::MAX, f32::MAX, 0f32, 0f32], false);
+            for y in 0..f.height {
+                let row = &f.pixels[y * f.stride..y * f.stride + f.width];
+                for (x, &p) in row.iter().enumerate() {
+                    if p == 255 {
+                        any = true;
+                        b = [b[0].min(x as f32), b[1].min(y as f32), b[2].max(x as f32 + 1.0), b[3].max(y as f32 + 1.0)];
+                    }
+                }
+            }
+            if any { Finds { boxes: vec![b], scores: vec![0.9], labels: vec![0] } } else { Finds::default() }
+        }).collect())
+    }
+}
+
+fn bright_frame(w: usize, h: usize, r: [usize; 4]) -> Vec<u8> {
+    let mut f = vec![40u8; w * h];
+    for y in r[1]..r[3] {
+        f[y * w + r[0]..y * w + r[2]].fill(255);
+    }
+    f
+}
+
+fn run_regions(regions: Option<tamserve_boxes::regions::Regions>) -> (Vec<Vec<(usize, usize)>>, Vec<BBox>) {
+    let det = Bright { names: vec!["person".into()], sizes: vec![] };
+    let mut t = BoxTracker::new(det, TrackerOptions { look_every: LookEvery::All(1), regions, ..Default::default() }).unwrap();
+    let mut boxes = vec![];
+    for k in 0..6usize {
+        let r = [900 + 10 * k, 500, 930 + 10 * k, 560];
+        let p = bright_frame(1920, 1080, r);
+        let moved = [r[0] as f32, r[1] as f32, r[2] as f32, r[3] as f32];
+        let out = t.step_regions(&[(1u8, GrayFrame::new(&p, 1920, 1080).unwrap())], &|_| false, &|_| vec![moved]).unwrap();
+        if let Some(f) = out[&1].get(&1) {
+            boxes.push(f.bbox);
+        }
+    }
+    (t.detector.sizes, boxes)
+}
+
+#[test]
+fn regions_crop_looks_and_finds_land_in_the_frame() {
+    let (sizes, boxes) = run_regions(Some(Default::default()));
+    assert_eq!(sizes[0], vec![(1920, 1080)], "a camera's first look is whole");
+    // One square: the one around what moved and the one around the followed object overlap,
+    // so they are joined into one a little over the model's size.
+    assert!(sizes[1..].iter().all(|s| s.len() == 1 && s[0].0 == s[0].1 && (416..440).contains(&s[0].0)), "{sizes:?}");
+    // The Kalman filter smooths, so the followed box trails the rectangle a little.
+    let last = boxes.last().unwrap();
+    assert!((last[0] - 950.0).abs() < 6.0 && (last[1] - 500.0).abs() < 3.0 && (last[3] - 560.0).abs() < 3.0, "{last:?}");
+}
+
+#[test]
+fn without_regions_every_look_is_whole() {
+    let (sizes, whole) = run_regions(None);
+    assert!(sizes.iter().all(|s| s == &vec![(1920, 1080)]));
+    let (_, cropped) = run_regions(Some(Default::default()));
+    for (a, b) in whole.iter().zip(&cropped) {
+        assert!(a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-3), "the same boxes: {a:?} {b:?}");
+    }
+}
