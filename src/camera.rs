@@ -32,7 +32,7 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
 
-use crate::config::{Camera, DecodeSection, Decoder};
+use crate::config::{Camera, DecodeSection, Decoder, EncodeSection, Encoder};
 use crate::restream::Tap;
 use crate::{Error, Result};
 
@@ -103,6 +103,11 @@ pub struct Health {
     pub lighting_resets: AtomicU64,
     /// 1 while motion is held open.
     pub moving: AtomicBool,
+    /// Frames and bytes the encoder has produced (cameras with `encode = true`).
+    pub encoded: AtomicU64,
+    pub encoded_bytes: AtomicU64,
+    /// Times the encoder's backlog was full, so a frame was dropped rather than stall decoding.
+    pub encode_dropped: AtomicU64,
     last_error: Mutex<String>,
 }
 
@@ -191,6 +196,15 @@ pub struct Opening {
     pub realtime: bool,
     /// Where cameras with `record = true` write their segments, and how long each is.
     pub record: Option<RecordTo>,
+    /// How cameras with `encode = true` are encoded, from the frames decoded for detection.
+    pub encode: Option<EncodeSection>,
+}
+
+impl Opening {
+    pub fn with_encode(mut self, e: Option<EncodeSection>) -> Self {
+        self.encode = e;
+        self
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -210,6 +224,7 @@ impl From<&DecodeSection> for Opening {
             backoff: Backoff { first: d.backoff_first.unwrap_or(1.0), max: d.backoff_max.unwrap_or(30.0) },
             realtime: d.realtime,
             record: None,
+            encode: None,
         }
     }
 }
@@ -353,6 +368,96 @@ enum Outcome {
     Failed(String),
 }
 
+/// A name safe in a file path: letters, digits, '-', '_' and '.'; anything else becomes '_'.
+fn safe(name: &str) -> String {
+    name.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '_' }).collect()
+}
+
+/// The segment number to start at, so a reconnect continues a camera's numbering and never
+/// overwrites the segments it already wrote. `pattern` has one `%0Nd`.
+fn next_index(pattern: &str) -> Result<u32> {
+    let p = std::path::Path::new(pattern);
+    let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let file = p.file_name().and_then(|f| f.to_str()).unwrap_or("");
+    let Some(at) = file.find('%') else { return Ok(0) };
+    let Some(end) = file[at..].find('d').map(|i| at + i) else { return Ok(0) };
+    let (head, tail) = (&file[..at], &file[end + 1..]);
+    let mut next = 0;
+    for e in std::fs::read_dir(dir)?.flatten() {
+        let n = e.file_name();
+        let n = n.to_string_lossy();
+        if let Some(num) = n.strip_prefix(head).and_then(|r| r.strip_suffix(tail)) {
+            if let Ok(i) = num.parse::<u32>() {
+                next = next.max(i + 1);
+            }
+        }
+    }
+    Ok(next)
+}
+
+/// The encoder branch of a camera's pipeline, after the decoded tee: a frame-rate cap, scaling,
+/// and the encoder at its thread budget and low-delay settings, up to its parser (`encp`).
+/// What it writes to is made by [`encode_sink`] and linked in code: a `splitmuxsink` inside a
+/// bin parsed from a description cannot link its muxer, as the recorder found too.
+fn encode_branch(e: &EncodeSection, tee: &str) -> String {
+    let fps = e.fps.unwrap_or(25);
+    let key = ((e.keyframe_seconds * fps as f64).round() as u32).max(1);
+    let mut b = format!("{tee}. ! queue name=encq leaky=downstream max-size-buffers={} max-size-bytes=0 max-size-time=0 ! ", e.backlog);
+    if let Some(f) = e.fps {
+        b += &format!("videorate drop-only=true ! video/x-raw,framerate={f}/1 ! ");
+    }
+    let format = if e.encoder == Encoder::Vah265 { "NV12" } else { "I420" };
+    b += "videoconvert ! ";
+    let mut caps = format!("video/x-raw,format={format}");
+    if let (Some(w), Some(h)) = (e.width, e.height) {
+        b += "videoscale ! ";
+        caps += &format!(",width={w},height={h}");
+    }
+    b += &caps;
+    b += " ! ";
+    b += &match e.encoder {
+        // Low delay (pred-struct=1): no frame waits for later ones, and SVT-AV1's CBR needs it.
+        // No lookahead: what keeps each encoder's memory small. Threads capped per encoder.
+        Encoder::Svtav1 => {
+            let rate = match e.bitrate_kbps { Some(k) => format!("target-bitrate={k} crf=-1"), None => format!("crf={}", e.crf) };
+            format!("svtav1enc name=enc preset={} logical-processors={} intra-period-length={} {rate} \
+                     parameters-string=\"pred-struct=1:lookahead=0\" ! av1parse name=encp", e.preset, e.threads, key - 1)
+        }
+        Encoder::Vah265 => {
+            let rate = match e.bitrate_kbps { Some(k) => format!("rate-control=cbr bitrate={k}"), None => format!("rate-control=cqp qpi={}", e.crf.clamp(0, 51)) };
+            format!("vah265enc name=enc key-int-max={key} b-frames=0 target-usage=7 {rate} ! h265parse name=encp")
+        }
+        Encoder::X265 => {
+            let (rate, crf) = match e.bitrate_kbps { Some(k) => (format!("bitrate={k}"), String::new()), None => (String::new(), format!(":crf={}", e.crf)) };
+            format!("x265enc name=enc speed-preset=ultrafast tune=zerolatency key-int-max={key} {rate} \
+                     option-string=\"pools={}:frame-threads=1{crf}\" ! h265parse name=encp", e.threads)
+        }
+    };
+    b
+}
+
+/// Where an encoded camera's video goes: Matroska segments numbered on from what is already
+/// there (so a reconnect never overwrites), or nowhere (`output = "null"`).
+fn encode_sink(camera: &Camera, e: &EncodeSection) -> Result<gst::Element> {
+    if e.output == "null" {
+        return gst::ElementFactory::make("fakesink").property("sync", false).build()
+            .map_err(|_| Error::Invalid("GStreamer has no fakesink".into()));
+    }
+    let location = e.output.replace("{camera}", &safe(&camera.name));
+    let start = next_index(&location)?;
+    gst::ElementFactory::make("splitmuxsink")
+        .property("location", &location)
+        .property("start-index", i32::try_from(start).unwrap_or(i32::MAX))
+        .property("max-size-time", (e.segment_seconds * 1e9) as u64)
+        .property("max-files", e.max_files)
+        .property("muxer-factory", "matroskamux")
+        .property("async-finalize", true)
+        .property("send-keyframe-requests", true)
+        .build().map_err(|_| Error::Invalid("GStreamer has no splitmuxsink (gstreamer1.0-plugins-good)".into()))
+}
+
+
 fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -384,11 +489,25 @@ fn on_source_setup(src: &gst::Element, camera: &Camera, how: &Opening) {
     });
 }
 
+/// What follows a decoder: `videoconvert ! videoscale ! caps ! appsink`, the gray frames for
+/// detection. With `encode`, the decoded frames are teed first: decode once, use twice. Each
+/// branch has a leaky queue of its own, so neither the encoder nor detection can stall the
+/// decoder or the other.
+fn after_decoder(caps: &str, sync: bool, encode: Option<&str>) -> String {
+    let detect = format!("videoconvert ! videoscale ! {caps} ! appsink name=sink max-buffers=1 drop=true sync={sync} \
+                          enable-last-sample=false");
+    match encode {
+        None => detect,
+        Some(enc) => format!("tee name=dt dt. ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 ! \
+                              {detect} {enc}"),
+    }
+}
+
 /// The decoding end: `queue ! decodebin3`, whose video is linked when it appears to a bin
-/// `videoconvert ! videoscale ! caps ! appsink`. Returns the queue, to feed, and the sink.
-fn decoder(pipeline: &gst::Pipeline, caps: &str, sync: bool) -> std::result::Result<(gst::Element, gst_app::AppSink), String> {
-    let tail = gst::parse::bin_from_description(&format!("videoconvert ! videoscale ! {caps} ! \
-        appsink name=sink max-buffers=1 drop=true sync={sync} enable-last-sample=false"), true)
+/// [`after_decoder`]. Returns the queue, to feed, and the sink.
+fn decoder(pipeline: &gst::Pipeline, caps: &str, sync: bool, encode: Option<(&str, &gst::Element)>)
+           -> std::result::Result<(gst::Element, gst_app::AppSink), String> {
+    let tail = gst::parse::bin_from_description(&after_decoder(caps, sync, encode.map(|e| e.0)), true)
         .map_err(|e| format!("could not build the decoder: {e}"))?;
     let sink = tail.by_name("sink").and_then(|s| s.downcast::<gst_app::AppSink>().ok()).ok_or("no appsink")?;
     let q = gst::ElementFactory::make("queue").property("max-size-time", 2_000_000_000u64)
@@ -396,6 +515,11 @@ fn decoder(pipeline: &gst::Pipeline, caps: &str, sync: bool) -> std::result::Res
     let dec = element("decodebin3")?;
     pipeline.add_many([&q, &dec, tail.upcast_ref()]).map_err(|e| e.to_string())?;
     q.link(&dec).map_err(|e| e.to_string())?;
+    if let Some((_, out)) = encode {
+        // The encoder's parser is the bin's ghosted src pad.
+        pipeline.add(out).map_err(|e| e.to_string())?;
+        tail.link(out).map_err(|e| format!("could not link the encoder to its output: {e}"))?;
+    }
     let into = tail.static_pad("sink").ok_or("the decoder has no sink pad")?;
     dec.connect_pad_added(move |_, pad| {
         if !into.is_linked() && pad.current_caps().or_else(|| Some(pad.query_caps(None)))
@@ -412,8 +536,10 @@ fn element(factory: &str) -> std::result::Result<gst::Element, String> {
 
 /// The shared pipeline: one source, parsed once, teed to the decoder, the recorder and
 /// the live stream. Its parsebin's first video stream is linked when it appears.
+#[allow(clippy::too_many_arguments)]
 fn shared_pipeline(camera: &Camera, target: &str, how: &Opening, caps: &str, sync: bool, health: &Arc<Health>,
-                   live: Option<&Arc<Tap>>) -> std::result::Result<(gst::Pipeline, gst_app::AppSink), String> {
+                   live: Option<&Arc<Tap>>, encode: Option<(&str, &gst::Element)>)
+                   -> std::result::Result<(gst::Pipeline, gst_app::AppSink), String> {
     let pipeline = gst::Pipeline::new();
     let src = gst::ElementFactory::make("urisourcebin").property("uri", target).build()
         .map_err(|_| "GStreamer has no urisourcebin".to_string())?;
@@ -421,7 +547,7 @@ fn shared_pipeline(camera: &Camera, target: &str, how: &Opening, caps: &str, syn
     let parse = element("parsebin")?;
     pipeline.add_many([&src, &parse]).map_err(|e| e.to_string())?;
     // Added now, in the NULL state, and started with the pipeline: fed once the stream is known.
-    let (decoded, sink) = decoder(&pipeline, caps, sync)?;
+    let (decoded, sink) = decoder(&pipeline, caps, sync, encode)?;
 
     // The source's first stream that is not audio goes to parsebin; any others are dropped.
     let parse_in = parse.static_pad("sink").ok_or("parsebin has no sink pad")?;
@@ -545,14 +671,18 @@ fn shared_pipeline(camera: &Camera, target: &str, how: &Opening, caps: &str, syn
     Ok((pipeline, sink))
 }
 
-/// The pipeline of a camera that is only followed: `uridecodebin ! ... ! appsink`.
-fn simple_pipeline(camera: &Camera, target: &str, how: &Opening, caps: &str, sync: bool)
-                   -> std::result::Result<(gst::Pipeline, gst_app::AppSink), String> {
-    let desc = format!("uridecodebin name=src uri={} ! videoconvert ! videoscale ! {caps} ! \
-                        appsink name=sink max-buffers=1 drop=true sync={sync} enable-last-sample=false",
-                       quote(target));
+/// The pipeline of a camera that is neither recorded nor watched live: `uridecodebin !` and
+/// [`after_decoder`] (detection, and the encoder if the camera is encoded).
+fn simple_pipeline(camera: &Camera, target: &str, how: &Opening, caps: &str, sync: bool,
+                   encode: Option<(&str, &gst::Element)>) -> std::result::Result<(gst::Pipeline, gst_app::AppSink), String> {
+    let desc = format!("uridecodebin name=src uri={} ! {}", quote(target), after_decoder(caps, sync, encode.map(|e| e.0)));
     let pipeline = gst::parse::launch(&desc).map_err(|e| format!("could not build the pipeline: {e}"))?
         .downcast::<gst::Pipeline>().map_err(|_| "not a pipeline".to_string())?;
+    if let Some((_, out)) = encode {
+        let parser = pipeline.by_name("encp").ok_or("the encoder has no parser")?;
+        pipeline.add(out).map_err(|e| e.to_string())?;
+        parser.link(out).map_err(|e| format!("could not link the encoder to its output: {e}"))?;
+    }
     if let Some(src) = pipeline.by_name("src") {
         on_source_setup(&src, camera, how);
     }
@@ -570,15 +700,44 @@ fn stream(camera: &Camera, target: &str, how: &Opening, health: &Arc<Health>, ne
     }
     let sync = how.realtime || !is_live(target);
     let shared = (camera.record && how.record.is_some()) || live.is_some();
+    let encode = match (&how.encode, camera.encode) {
+        (Some(e), true) => match encode_sink(camera, e) {
+            Ok(out) => Some((encode_branch(e, "dt"), out)),
+            Err(err) => return Outcome::Failed(format!("cannot set up the encoder: {err}")),
+        },
+        _ => None,
+    };
+    let enc = encode.as_ref().map(|(chain, out)| (chain.as_str(), out));
     let built = if shared {
-        shared_pipeline(camera, target, how, &caps, sync, health, live)
+        shared_pipeline(camera, target, how, &caps, sync, health, live, enc)
     } else {
-        simple_pipeline(camera, target, how, &caps, sync)
+        simple_pipeline(camera, target, how, &caps, sync, enc)
     };
     let (pipeline, sink) = match built {
         Ok(b) => b,
         Err(e) => return Outcome::Failed(e),
     };
+    if encode.is_some() {
+        // Count what the encoder produces, and how often its backlog was full. by_name looks
+        // into the decoder's bin too, where a recorded or live camera's encoder sits.
+        if let Some(pad) = pipeline.by_name("enc").and_then(|e| e.static_pad("src")) {
+            let h = health.clone();
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(b) = info.buffer() {
+                    h.encoded.fetch_add(1, Ordering::Relaxed);
+                    h.encoded_bytes.fetch_add(b.size() as u64, Ordering::Relaxed);
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
+        if let Some(q) = pipeline.by_name("encq") {
+            let h = health.clone();
+            q.connect("overrun", false, move |_| {
+                h.encode_dropped.fetch_add(1, Ordering::Relaxed);
+                None
+            });
+        }
+    }
     let generation = health.generation.load(Ordering::Relaxed);
     let (h, n, b) = (health.clone(), newest.clone(), bell.clone());
     let mut count = 0u64;
@@ -659,4 +818,29 @@ fn finish(pipeline: &gst::Pipeline, bus: &gst::Bus) {
         return;
     }
     let _ = bus.timed_pop_filtered(gst::ClockTime::from_seconds(3), &[gst::MessageType::Eos, gst::MessageType::Error]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reconnect_continues_the_segment_numbers() {
+        let mut r = [0u8; 8];
+        getrandom::fill(&mut r).unwrap();
+        let d = std::env::temp_dir().join(format!("tsb-seg-{}", u64::from_le_bytes(r)));
+        let pattern = format!("{}/gate/%05d.mkv", d.display());
+        assert_eq!(next_index(&pattern).unwrap(), 0); // and the folder is made
+        for i in [0, 1, 7] {
+            std::fs::write(d.join(format!("gate/{i:05}.mkv")), b"x").unwrap();
+        }
+        std::fs::write(d.join("gate/notes.txt"), b"x").unwrap();
+        assert_eq!(next_index(&pattern).unwrap(), 8);
+    }
+
+    #[test]
+    fn camera_names_are_safe_in_paths() {
+        assert_eq!(safe("gate/../../etc"), "gate_.._.._etc");
+        assert_eq!(safe("Dock 3"), "Dock_3");
+    }
 }

@@ -55,6 +55,16 @@ curl -sf localhost:19301/metrics | grep -q 'tamserve_camera_up{camera="c1"} 1' &
 curl -sf -X POST localhost:19301/v1/chat/completions -d '{"model":"c1","messages":[{"role":"user","content":"?"}]}' \
   | python3 -c "import json,sys; r=json.load(sys.stdin); assert r['object']=='chat.completion'; json.loads(r['choices'][0]['message']['content'])" \
   && echo "ok: OpenAI-compatible /v1/chat/completions"
+kill $SOLO; sleep 1
+# Decode once, use twice: c1 is also encoded, from the same decode, to AV1 segments.
+box_config 19301 | sed 's|^\[http\]|[encode]\nthreads = 1\npreset = 12\nbitrate_kbps = 300\nfps = 10\nwidth = 480\nheight = 320\noutput = "'"$W"'/rec/{camera}/%05d.mkv"\nsegment_seconds = 4\n\n[http]|' \
+  | awk '/name = "c1"/ {print; print "encode = true"; next} {print}' > solo.toml
+"$B" run --config solo.toml > solo.jsonl 2> solo.log & SOLO=$!
+sleep 12
+check "s['cameras']['c1']['encoded_frames'] > 50 and s['cameras']['c2']['encoded_frames'] == 0 and s['cameras']['c1']['frames_used'] > 50" "$(status 19301)" "c1 is detected and encoded from one decode"
+SEG=$(ls "$W"/rec/c1/*.mkv | head -1)
+[ "$(ffprobe -v error -select_streams v -show_entries stream=codec_name -of csv=p=0 "$SEG")" = av1 ] && echo "ok: c1's segments are AV1" \
+  || { echo "FAIL: no AV1 segment for c1"; exit 1; }
 pkill -f "mediamtx mediamtx.yml"; sleep 6
 check "all(s['cameras'][c]['state'] in ('down','connecting') for c in ['c1','c2'])" "$(status 19301)" "cameras go down with the server"
 "$MTX" mediamtx.yml & sleep 1; pkill -f "ffmpeg.*18554" || true; sleep 0.5; publish; sleep 10
@@ -81,14 +91,16 @@ assert worst < 6, f"a camera went {worst:.1f} s without results"
 print(f"ok: the longest gap in any camera's results across the kill: {worst:.1f} s")
 PY
 
-# One connection, shared: c1 recorded and watched live over RTSP with its password, the motion gate on.
-box_config 19304 '[motion]\n[record]\ndir = "rec"\nsegment_seconds = 2\n' \
-  | sed 's/^name = "c1"$/name = "c1"\nrecord = true\nlive = true/' > rec.toml
+# One connection, shared: c1 recorded, watched live over RTSP with its password and encoded to an AV1
+# uplink copy, the motion gate on.
+box_config 19304 '[motion]\n[record]\ndir = "rec"\nsegment_seconds = 2\n[encode]\nthreads = 1\nfps = 10\nwidth = 480\nheight = 320\nbitrate_kbps = 300\noutput = "up/{camera}/%05d.mkv"\nsegment_seconds = 2\n' \
+  | sed 's/^name = "c1"$/name = "c1"\nrecord = true\nlive = true\nencode = true/' > rec.toml
 "$B" run --config rec.toml > rec.jsonl 2> rec.log & REC=$!
 sleep 6
 timeout 4 curl -sf localhost:19304/live/c1.ts -o live.ts || true
 sleep 4
 check "s['cameras']['c1']['state'] == 'up' and s['cameras']['c1']['segments'] >= 2 and s['cameras']['c2']['segments'] == 0" "$(status 19304)" "c1 recorded over RTSP in 2 s segments, c2 not"
+check "s['cameras']['c1']['encoded_frames'] > 30 and s['cameras']['c1']['frames_used'] > 30" "$(status 19304)" "c1 recorded, live and encoded at once"
 fail() { echo "FAIL: $1"; exit 1; }
 # curl was cut off by its timeout, so the file may end mid-packet: only its start is checked.
 python3 -c "import sys; b=open('live.ts','rb').read(); assert len(b) > 8000 and b[0] == 0x47 and b[188] == 0x47, len(b)" \
@@ -111,5 +123,10 @@ kill -TERM $REC; wait $REC || true
 LAST=$(ls rec/c1/*.ts | tail -1)
 [ -z "$(ffmpeg -v error -i "$LAST" -f null - 2>&1)" ] || fail "SIGTERM left $LAST broken"
 grep -q "stopping: closing the cameras" rec.log || fail "SIGTERM was not handled"
+for f in up/c1/*.mkv; do
+  [ "$(ffprobe -v error -select_streams v -show_entries stream=codec_name -of csv=p=0 "$f")" = av1 ] || fail "$f is not AV1"
+done
+[ "$(ls up/c1/*.mkv | wc -l)" -ge 2 ] || fail "too few AV1 segments beside the recording"
+echo "ok: the AV1 uplink segments sit beside the camera's own recording"
 echo "ok: SIGTERM closes the open segment whole"
 echo "ALL PASSED"

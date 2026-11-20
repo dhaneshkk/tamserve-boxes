@@ -164,6 +164,44 @@ lean proofs/Retention.lean && lean proofs/Regions.lean
 
 [`notebooks/motion_record_live.ipynb`](notebooks/motion_record_live.ipynb) is one Colab cell that does all of this on a test clip. It measures the gate against the detector (MCC), runs a box that records and streams, reads it back through `/v1/chat/completions`, sweeps the recordings, and checks the proof. Set `TSB_BRANCH` to try a branch.
 
+## Uplink copies: decode once, use twice
+
+`record` (above) keeps the camera's own stream untouched, for evidence. `encode` adds a **smaller copy for the uplink**: AV1 at a few hundred kbit/s, made from the decode detection already does. A camera can have any of the three.
+
+A camera with `encode = true` is encoded from **the same decode** detection uses. After the decoder, a `tee` hands each decoded frame to both branches, each behind a leaky queue of its own, so a slow encoder drops frames (counted in `tamserve_camera_encode_dropped_total`) instead of stalling decoding or detection. There's no second RTSP connection, no second decode, and no process per camera.
+
+```
+rtsp ─ parse ─ tee ┬─ record: the camera's own H.264/H.265 ─▶ MPEG-TS segments
+                   ├─ live: the same, ─▶ /live/<camera>.ts
+                   └─ decode ─ tee ┬─ gray plane, newest frame ─▶ YOLOX (batched over all cameras) ─▶ tracker
+                                   └─ frame-rate cap ─ scale ─ SVT-AV1 (1 thread, low delay) ─▶ Matroska segments
+```
+
+- **One CPU budget.** Each encoder is held to `threads` (SVT-AV1's `logical-processors`), so 20 encoders on a 4-core box don't each start a thread per core and crowd out the detector. At start-up the box logs detection threads + encoders × threads against its cores, and warns past twice the core count.
+- **Low delay, no lookahead.** SVT-AV1 runs with `pred-struct=1:lookahead=0`, so no frame waits for later ones, and constant bitrate (which SVT-AV1 only does in low delay) suits an uplink. This is also what keeps each encoder small: it holds 2 frames in flight instead of 42.
+- **Segments.** Matroska segments of `segment_seconds`. Each frame keeps its real capture time, and after a reconnect the numbering continues rather than overwriting. `max_files` keeps a rolling window, and `output = "null"` encodes and discards, for measuring.
+- **Encoders.** `svtav1` is AV1 on the CPU, the smallest uplink for its CPU cost. `vah265` is HEVC on the integrated GPU: almost no CPU, but larger, and **untested here** (no Intel GPU). `x265` is HEVC on the CPU.
+
+Measured (before recording and live view were added) on a 2-core VM, 4 RTSP cameras at 15 fps, encoding to 480×320 at 10 fps, SVT-AV1 preset 12, 300 kbit/s, with YOLOX following on every camera:
+
+| 4 cameras, 1080p | CPU (cores) | memory |
+|---|---|---|
+| **one process, decode once** (this) | **1.06** | **438 MB** |
+| detection + an ffmpeg per camera, decoding again | 1.18 | 843 MB |
+| a `tamserve-boxes` process per camera | 1.02 | 822 MB |
+
+With 960×640 cameras: 0.70 / 0.71 / 0.72 cores, and 297 / 572 / 699 MB.
+
+**Memory halves; CPU falls less.** Software decoding of these streams is cheap next to encoding, so decoding once saved about 10% of CPU at 1080p and about nothing at 960×640. The CPU levers that matter are each encoder's `threads`, `preset`, `fps` and size, and decoding on the integrated GPU (`decoder = "vaapi"`), which takes decoding off the CPU altogether.
+
+What low delay is worth, measured alone (one SVT-AV1 encoder on 36 s of 1080p input, preset 12, 1 thread, 300 kbit/s):
+
+| encoding to | default (random access, lookahead) | low delay, no lookahead |
+|---|---|---|
+| 480×320 | 145 MB, 5.4 s CPU | 119 MB, 4.5 s CPU |
+| 1920×1080 | 428 MB, 12.6 s CPU | **216 MB, 8.7 s CPU** |
+
+
 ## Many boxes
 
 Each box has its own `cameras.toml`, passwords and all. The coordinator's config ([`config/coordinator.toml`](config/coordinator.toml)) lists only camera names and their weights, so **no camera address or password crosses the network**.

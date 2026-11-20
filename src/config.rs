@@ -111,6 +111,73 @@ pub struct DecodeSection {
     pub realtime: bool,
 }
 
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Encoder {
+    /// SVT-AV1 on the CPU, low-delay: the smallest uplink for the CPU it costs.
+    #[default]
+    Svtav1,
+    /// HEVC on the integrated GPU through VA-API: almost no CPU, larger than AV1.
+    Vah265,
+    /// HEVC on the CPU (x265), for boxes with neither.
+    X265,
+}
+
+/// Encoding for cameras with `encode = true`, from the frames already decoded for detection.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct EncodeSection {
+    #[serde(default)]
+    pub encoder: Encoder,
+    /// CPU threads each encoder may use (SVT-AV1's logical-processors, x265's pools). 1 or 2 keeps
+    /// 20 encoders on a 4-core box from fighting each other and the detector.
+    #[serde(default = "one")]
+    pub threads: usize,
+    /// SVT-AV1 preset, 0 (best) to 13 (fastest). 10 to 12 suit live CCTV on a small CPU.
+    #[serde(default = "preset")]
+    pub preset: u32,
+    /// Constant bitrate in kbit/s (low-delay CBR, what an uplink wants). None: constant quality (`crf`).
+    pub bitrate_kbps: Option<u32>,
+    #[serde(default = "crf")]
+    pub crf: i32,
+    /// A keyframe every this many seconds: how soon a viewer or a cut segment can start.
+    #[serde(default = "keyframe")]
+    pub keyframe_seconds: f64,
+    /// Frames a second sent to the encoder; the rest are dropped first. None: the camera's own rate.
+    pub fps: Option<u32>,
+    /// Scale before encoding (the uplink can be smaller than what detection sees). None: as decoded.
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// Frames the encoder may fall behind by before frames are dropped, so a slow encoder never stalls
+    /// decoding or detection.
+    #[serde(default = "backlog")]
+    pub backlog: u32,
+    /// Where each camera's video goes: a file pattern with `{camera}` and a `%05d` segment number
+    /// (Matroska segments of `segment_seconds`), or "null" to encode and discard (for measuring).
+    pub output: String,
+    #[serde(default = "segment")]
+    pub segment_seconds: f64,
+    /// Segments kept per camera; older ones are deleted. 0: keep all.
+    #[serde(default)]
+    pub max_files: u32,
+}
+
+fn preset() -> u32 {
+    12
+}
+fn crf() -> i32 {
+    40
+}
+fn keyframe() -> f64 {
+    2.0
+}
+fn backlog() -> u32 {
+    4
+}
+fn segment() -> f64 {
+    60.0
+}
+
 #[derive(Deserialize, Debug, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct HttpSection {
@@ -136,6 +203,9 @@ pub struct CameraSection {
     /// Serve this camera's stream on `GET /live/<name>.ts`.
     #[serde(default)]
     pub live: bool,
+    /// Also encode this camera to a smaller copy (AV1) from the frames decoded for detection ([encode]).
+    #[serde(default)]
+    pub encode: bool,
     /// Parts of this camera's picture where motion is not looked for:
     /// [[left, top, right, bottom], ...] as shares of its width and height (0 to 1).
     #[serde(default)]
@@ -226,6 +296,7 @@ pub struct Config {
     pub http: HttpSection,
     pub motion: Option<MotionSection>,
     pub record: Option<RecordSection>,
+    pub encode: Option<EncodeSection>,
     #[serde(default, rename = "camera")]
     pub cameras: Vec<CameraSection>,
 }
@@ -248,6 +319,7 @@ pub struct Camera {
     pub weight: f64,
     pub record: bool,
     pub live: bool,
+    pub encode: bool,
     pub motion_mask: Vec<[f32; 4]>,
 }
 
@@ -360,14 +432,27 @@ impl Config {
                 return Err(Error::Invalid(format!(
                     "camera {:?}: a camera that records or is watched live names a folder and a URL: use letters, digits, `-`, `_` and `.` only", c.name)));
             }
+            if c.encode && cfg.encode.is_none() {
+                return Err(Error::Invalid(format!("camera {:?} has encode = true but there is no [encode] section", c.name)));
+            }
             cams.push(Camera { name: c.name.clone(), url: c.url.clone(), user: c.user.clone(), password,
                                look_every: c.look_every, weight: c.weight.unwrap_or(1.0), record, live: c.live,
-                               motion_mask: c.motion_mask.clone() });
+                               encode: c.encode, motion_mask: c.motion_mask.clone() });
             crate::motion::MotionOptions { mask: c.motion_mask.clone(), ..Default::default() }.check()
                 .map_err(|e| Error::Invalid(format!("camera {:?}: {e}", c.name)))?;
         }
         if inline {
             owner_only(path)?;
+        }
+        if let Some(e) = &cfg.encode {
+            if e.threads == 0 || e.preset > 13 || e.keyframe_seconds <= 0.0 || e.segment_seconds <= 0.0 || e.backlog == 0 {
+                return Err(Error::Invalid("[encode]: threads and backlog at least 1, preset 0 to 13, \
+                                           keyframe_seconds and segment_seconds above 0".into()));
+            }
+            if e.output != "null" && !(e.output.contains("{camera}") && e.output.contains('%')) {
+                return Err(Error::Invalid("[encode] output needs {camera} and a %05d segment number, such as \
+                                           \"/var/lib/tamserve/{camera}/%05d.mkv\", or \"null\"".into()));
+            }
         }
         if let Some(t) = &cfg.http.token_file {
             owner_only(&if t.is_relative() { base.join(t) } else { t.clone() })?;
@@ -566,6 +651,23 @@ mod tests {
             let cfg = write(&d, "c.toml", &format!("{HEAD}{body}"), 0o600);
             assert!(Config::load(&cfg).is_err(), "{body}");
         }
+    }
+
+    #[test]
+    fn encoding_needs_a_section_and_a_segment_pattern() {
+        let d = dir();
+        let cam = "[[camera]]\nname=\"a\"\nurl=\"rtsp://h/1\"\nencode=true\n";
+        let none = write(&d, "n.toml", &format!("{HEAD}{cam}"), 0o600);
+        assert!(Config::load(&none).unwrap_err().to_string().contains("no [encode]"));
+        let bad = write(&d, "b.toml", &format!("{HEAD}[encode]\noutput=\"/tmp/x.mkv\"\n{cam}"), 0o600);
+        assert!(Config::load(&bad).unwrap_err().to_string().contains("{camera}"));
+        let threads = write(&d, "t.toml", &format!("{HEAD}[encode]\noutput=\"null\"\nthreads=0\n{cam}"), 0o600);
+        assert!(Config::load(&threads).is_err());
+        let good = write(&d, "g.toml", &format!("{HEAD}[encode]\noutput=\"/v/{{camera}}/%05d.mkv\"\nbitrate_kbps=300\n{cam}"), 0o600);
+        let (cfg, cams) = Config::load(&good).unwrap();
+        let e = cfg.encode.unwrap();
+        assert!(cams[0].encode);
+        assert_eq!((e.encoder, e.threads, e.preset, e.bitrate_kbps), (Encoder::Svtav1, 1, 12, Some(300)));
     }
 
     #[test]
