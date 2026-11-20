@@ -149,3 +149,49 @@ fn bad_settings_are_rejected() {
     assert!(BoxTracker::new(scripted(|_, _| vec![]), each).is_err());
     assert!(GrayFrame::new(&[0u8; 10], 4, 4).is_err());
 }
+
+/// Steps with a gate: `quiet(camera, step)`. Returns each step's ids for camera 1.
+fn run_gated<D: Detect>(t: &mut BoxTracker<D, u8>, steps: u8, cams: &[u8], quiet: impl Fn(u8, u8) -> bool) -> Vec<Vec<u32>> {
+    (0..steps).map(|k| {
+        let pixels: Vec<Vec<u8>> = cams.iter().map(|&c| frame(c, k, 120)).collect();
+        let frames: Vec<(u8, GrayFrame)> = cams.iter().zip(&pixels).map(|(&c, p)| (c, GrayFrame::new(p, 200, 120).unwrap())).collect();
+        let out = t.step_gated(&frames, &|c| quiet(*c, k)).unwrap();
+        out[&1].keys().copied().collect()
+    }).collect()
+}
+
+#[test]
+fn a_gate_that_is_never_quiet_changes_nothing() {
+    let finds = |cam: u8, step: u8| if cam == 1 && step < 9 { vec![(walk(step), 0.9, 0)] } else { vec![] };
+    let mut plain = BoxTracker::new(scripted(finds), opts(3, 4)).unwrap();
+    let mut gated = BoxTracker::new(scripted(finds), opts(3, 4)).unwrap();
+    let want: Vec<Vec<u32>> = run(&mut plain, 20, &[1, 2]).into_iter().map(|m| m[&1].clone()).collect();
+    assert_eq!(run_gated(&mut gated, 20, &[1, 2], |_, _| false), want);
+    assert_eq!(plain.detector.looks, gated.detector.looks);
+}
+
+#[test]
+fn a_quiet_camera_with_nothing_followed_is_not_looked_at() {
+    // Nothing is ever there; the camera is quiet from step 2 on, and moves at step 12.
+    let mut t = BoxTracker::new(scripted(|_, _| vec![]), opts(1, 4)).unwrap();
+    run_gated(&mut t, 16, &[1], |_, k| (2..12).contains(&k));
+    let looked: Vec<usize> = t.detector.looks.iter().map(|l| l.len()).collect();
+    assert_eq!(looked.len(), 16);
+    assert_eq!(looked.iter().sum::<usize>(), 6, "looks only on steps 0, 1 and 12 to 15: {looked:?}");
+    assert!(looked[2..12].iter().all(|&n| n == 0));
+}
+
+#[test]
+fn a_quiet_camera_still_follows_what_it_has() {
+    // A person stands still (no motion) from step 3: they are followed while seen, and
+    // only once they are gone and held out does the gate stop the looks.
+    let finds = |_: u8, step: u8| if step < 8 { vec![([50.0, 30.0, 80.0, 100.0], 0.9, 0)] } else { vec![] };
+    let mut t = BoxTracker::new(scripted(finds), opts(1, 3)).unwrap();
+    let ids = run_gated(&mut t, 20, &[1], |_, k| k >= 3);
+    assert!(ids[..8].iter().all(|i| i == &vec![1]), "{ids:?}");
+    let looked: Vec<usize> = t.detector.looks.iter().map(|l| l.len()).collect();
+    // Seen up to step 7; held unseen through step 11 (hold 3 + the step it is dropped on); then quiet.
+    assert!(looked[..12].iter().all(|&n| n == 1), "{looked:?}");
+    assert!(looked[12..].iter().all(|&n| n == 0), "{looked:?}");
+    assert_eq!(t.skipped(), &[1]);
+}

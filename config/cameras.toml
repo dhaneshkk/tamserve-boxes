@@ -24,12 +24,27 @@ backoff_max = 30
 listen = "127.0.0.1:9300"        # /metrics (Prometheus), /status, /v1/chat/completions (OpenAI-compatible)
 # token_file = "/etc/tamserve/http.token"
 
+[motion]                         # look only where something moves (and keep motion in recordings)
+hold = 10                        # frames a camera stays awake after it last moved
+
+[record]
+dir = "/var/lib/tamserve/recordings"
+segment_seconds = 10
+all_days = 1                     # every segment
+motion_days = 3                  # with motion
+objects_days = 14                # with any object
+labels = { person = 30 }
+max_gb = 400                     # over this, what would expire first goes first
+# pins: /var/lib/tamserve/recordings/pins.json, [{"camera": "gate", "from": ms, "to": ms}]
+
 [[camera]]
 name = "gate"
 url = "rtsp://10.0.0.21/Streaming/Channels/102"
 user = "viewer"
 password_file = "/etc/tamserve/secrets/gate"
 look_every = 1                   # this camera's own
+record = true                    # to [record] dir, from this box's one connection
+live = true                      # GET /live/gate.ts on [http]
 
 [[camera]]
 name = "yard"

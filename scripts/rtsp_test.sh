@@ -1,6 +1,7 @@
 #!/bin/bash
 # End-to-end test with a real RTSP server that needs a password: reconnects, health metrics, passwords kept off
-# command lines, and a coordinator moving cameras off a box that is killed. Needs: mediamtx, ffmpeg, curl, python3,
+# command lines, a coordinator moving cameras off a box that is killed, and one connection per camera shared by the
+# detector, the recorder and live viewers. Needs: mediamtx, ffmpeg, curl, python3,
 # OpenVINO's C library on LD_LIBRARY_PATH, and the release binary. Run from the repository's root:
 #   scripts/rtsp_test.sh MODEL.onnx VIDEO.mp4
 # MODEL: a 1-channel YOLOX (tamserve-boxes fold); VIDEO: any short H.264 video. Exits non-zero on any failure.
@@ -78,4 +79,27 @@ worst = max(min((t for t in v if t > kill), default=1e18) - max((t for t in v if
 assert worst < 6, f"a camera went {worst:.1f} s without results"
 print(f"ok: the longest gap in any camera's results across the kill: {worst:.1f} s")
 PY
+
+# One connection, shared: c1 recorded and watched live over RTSP with its password, the motion gate on.
+box_config 19304 '[motion]\n[record]\ndir = "rec"\nsegment_seconds = 2\n' \
+  | sed 's/^name = "c1"$/name = "c1"\nrecord = true\nlive = true/' > rec.toml
+"$B" run --config rec.toml > rec.jsonl 2> rec.log & REC=$!
+sleep 6
+timeout 4 curl -sf localhost:19304/live/c1.ts -o live.ts || true
+sleep 4
+check "s['cameras']['c1']['state'] == 'up' and s['cameras']['c1']['segments'] >= 2 and s['cameras']['c2']['segments'] == 0" "$(status 19304)" "c1 recorded over RTSP in 2 s segments, c2 not"
+fail() { echo "FAIL: $1"; exit 1; }
+# curl was cut off by its timeout, so the file may end mid-packet: only its start is checked.
+python3 -c "import sys; b=open('live.ts','rb').read(); assert len(b) > 8000 and b[0] == 0x47 and b[188] == 0x47, len(b)" \
+  || fail "GET /live/c1.ts"
+echo "ok: GET /live/c1.ts streams MPEG-TS from the box's own connection"
+[ "$(curl -s -o /dev/null -w '%{http_code}' localhost:19304/live/c2.ts)" = 404 ] || fail "c2 has a live stream"
+echo "ok: a camera without live = true has no live stream"
+SEG=$(ls rec/c1/*.ts | head -n -1 | tail -1)  # a closed one: the newest is still being written
+FRAMES=$(ffprobe -v error -count_frames -select_streams v -show_entries stream=nb_read_frames -of csv=p=0 "$SEG" | head -1)
+[ "$FRAMES" -gt 10 ] && [ -z "$(ffmpeg -v error -i "$SEG" -f null - 2>&1)" ] || fail "$SEG does not decode cleanly ($FRAMES frames)"
+echo "ok: a closed segment decodes on its own, without errors ($FRAMES frames)"
+[ "$(ls rec/c1/activity/*.jsonl | wc -l)" -ge 1 ] || fail "no activity log"
+echo "ok: the activity log is written"
+kill $REC
 echo "ALL PASSED"

@@ -9,6 +9,9 @@ The Rust port of [`tamserve.boxes`](https://github.com/dhaneshkk/tamserve/blob/m
 | **Reconnects** | a stream that fails or stalls is reopened, with backoff from 1 s doubling to 30 s, with jitter |
 | **Health** | per camera: state, frames decoded and used, reconnects, frame age, last error. Served as Prometheus `/metrics`, JSON `/status`, and OpenAI-compatible `/v1/chat/completions` |
 | **Throughput** | several OpenVINO requests in flight; each letterboxes its share of a look on its own thread |
+| **Motion gate** | motion is found on a 100-row copy of each frame; a camera where nothing moves and nothing is followed costs no looks (Frigate's idea) |
+| **One connection** | a camera that records or is watched live is read once: the detector, the recorder and every live viewer share the stream, never decoded twice or encoded |
+| **Recording** | MPEG-TS segments cut on keyframes, kept by what was in them: every segment, motion, objects, a label's own days, pins; a disk cap that frees the soonest-expiring first. The rules are proved in Lean 4 |
 | **Many boxes** | a coordinator assigns cameras to boxes by capacity, moves a dead box's cameras within seconds, evens out the load, and collects every result |
 | **Same results as Python** | byte-identical folded model, letterbox bit-identical to OpenCV, detections within 5e-5, the same ids on every frame |
 
@@ -18,6 +21,7 @@ The Rust port of [`tamserve.boxes`](https://github.com/dhaneshkk/tamserve/blob/m
 # Ubuntu / Debian: GStreamer and its plugins; the VA driver for decoding on an Intel integrated GPU
 sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base \
     gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav intel-media-va-driver
+# recording uses splitmuxsink (good) and live view mpegtsmux (bad); tests/recording.rs makes its clip with x264enc (ugly)
 cargo build --release          # target/release/tamserve-boxes
 cargo run --release --example gst_probe   # which decoders this box has (vah264dec: VA-API is usable)
 ```
@@ -64,8 +68,9 @@ With `[http] listen` set (127.0.0.1 by default; add `token_file` to require a be
 
 | endpoint | what |
 |---|---|
-| `GET /metrics` | Prometheus, per camera: `tamserve_camera_up`, `_state{state=…}`, `_frames_decoded_total`, `_frames_used_total`, `_reconnects_total`, `_frame_age_seconds`, `_objects`. Per loop: `tamserve_steps_total`, `tamserve_step_seconds_total`/`_last`, `tamserve_looks_total` |
+| `GET /metrics` | Prometheus, per camera: `tamserve_camera_up`, `_state{state=…}`, `_frames_decoded_total`, `_frames_used_total`, `_reconnects_total`, `_frame_age_seconds`, `_objects`; with `[motion]`, `_moving`, `_motion_steps_total`, `_looks_skipped_total`, `_lighting_resets_total`; with recording and live view, `_segments_total`, `_live_viewers`, `_live_bytes_total`. Per loop: `tamserve_steps_total`, `tamserve_step_seconds_total`/`_last`, `tamserve_looks_total`. With `[record]`: `tamserve_recordings_bytes`, `_segments`, `_pinned`, `_deleted_total{why=expired\|space}`, `_sweep_errors_total` |
 | `GET /status` | the same as JSON, with each camera's last error and latest objects |
+| `GET /live/<camera>.ts` | a camera with `live = true`, as MPEG-TS from the box's own connection: `ffplay`, VLC, mpv or mpegts.js. At most 8 viewers per camera and per box; a viewer who falls behind is dropped |
 | `GET /v1/models` and `POST /v1/chat/completions` | OpenAI-compatible. `model` is a camera's name or `"all"`, and the reply's message is that camera's latest objects and health as JSON |
 
 Alert on `tamserve_camera_frame_age_seconds > 10`, or on `rate(tamserve_camera_reconnects_total[5m]) > 0`.
@@ -88,6 +93,69 @@ On a 2-core VM at saturation (8 cameras, a look every frame), 2 requests raised 
 ### VA-API
 
 `decoder = "vaapi"` ranks GStreamer's VA-API decoders (`vah264dec`, `vah265dec`) first. `"software"` ranks them out, and `"auto"` leaves GStreamer's own ranking. Decoded frames come back to the CPU, gray, for detection. If `vaapi` is asked for and there are no VA decoders, `run` refuses to start and names the packages to install. **The VA-API path has not been tested on hardware**: the machine this was built on has no Intel GPU. Run `gst_probe` on the box first.
+
+## Motion, recording and live view
+
+Three things taken from [Frigate](https://github.com/blakeblackshear/frigate), done in this one process:
+
+```toml
+[motion]                 # look only where something moves
+hold = 10                # frames a camera stays awake after it last moved
+# gate = false           # find motion (for metrics and recording) but make every look
+
+[record]
+dir = "/var/lib/tamserve/recordings"
+segment_seconds = 10
+all_days = 1             # every segment
+motion_days = 3          # segments with motion (needs [motion])
+objects_days = 14        # segments with any object
+labels = { person = 30 } # a label's own days
+pre_seconds = 5          # kept before and after an event, with it
+post_seconds = 5
+max_gb = 400             # over this, the segments that would expire first go first
+
+[[camera]]
+name = "gate"
+url = "rtsp://10.0.0.21/Streaming/Channels/101"
+record = true            # or [record] all_cameras = true
+live = true              # GET /live/gate.ts
+```
+
+**The motion gate.** Each frame's gray plane is shrunk to 100 rows by area averaging and compared with a running average of the frames before it. Changed pixels are grouped into regions, and specks are dropped. When most of the picture changes at once, it's taken as the light, not motion: the IR cut filter switching at dusk, floodlights, lightning. The average then starts over from the new frame. A camera that hasn't moved for `hold` frames, and follows nothing (not even an object held after it was last seen), is left out of the look. It looks again on the first frame that moves, and a person standing still is still followed, because a camera that follows something is always looked at. With `[motion]` absent, nothing changes: `step_gated` with no quiet cameras is `step`, tested look for look.
+
+Measure the gate on your own footage before relying on it:
+
+```bash
+cargo run --release --example gate_mcc -- yolox_nano_gray.onnx night_clip.mp4 10 30   # hold, threshold
+# {"tp":298,"fp":16,"tn":436,"fn":0,"mcc":0.957,"recall":1.0,"looks_saved":0.58,...}   (a synthetic clip)
+```
+
+It runs the detector on every frame as the truth, and counts how often the gate would have slept through a frame with something on it (`fn`). Tune `hold` and `threshold` on night and day footage from each site until recall is where it must be. Then read MCC and the share of looks saved. `alpha` is per frame used: something bright that stood still and then left lingers in the average, so the gate stays awake longer. It errs towards looking, never towards missing.
+
+**One connection.** A camera with `record` or `live` is opened as `urisourcebin ! parsebin ! h264parse|h265parse ! tee`. The tee feeds the decoder (gray frames for detection, as before), a `splitmuxsink` writing MPEG-TS segments, and an `mpegtsmux` publishing to live viewers. The camera serves one client however many use it. Its stream is decoded once and never encoded. Parameter sets go before every keyframe, so each segment decodes on its own and a viewer who joins mid-stream starts at the next keyframe. A camera that only follows keeps the old `uridecodebin` pipeline. Recording and live view need H.264 or H.265; an MJPEG camera is still followed, with the reason in its `last_error`.
+
+**Retention.** Segments are `DIR/<camera>/<start ms>.ts`. MPEG-TS, not MP4, so a segment cut short by a power cut still plays up to its last flushed write. Each step, what a recording camera showed (motion, labels) goes to `DIR/<camera>/activity/<day>.jsonl`, with how far the log covers. A segment's keep-until is its end plus the longest retention of any activity within `pre_seconds` before it to `post_seconds` after it. A segment past the end of the log (the box stopped before writing what it showed) is kept the longest, since what it holds is unknown. A sweep every `sweep_seconds`:
+
+1. deletes every segment whose keep-until has passed;
+2. while the recordings take more than `max_gb`, deletes the segments that would expire first, so a motion-only segment goes before one with a person.
+
+A pinned segment is never deleted, nor each camera's newest. Pins are in `DIR/pins.json`, `[{"camera": "gate", "from": ms, "to": ms, "note": "incident 41"}]`; a pin without `camera` holds them all. A pins file that can't be read stops the sweep rather than deleting what it may pin.
+
+```bash
+tamserve-boxes sweep --config cameras.toml --dry-run   # what would go now, as JSON
+```
+
+[`proofs/Retention.lean`](proofs/Retention.lean) proves, with core Lean 4.31 and `omega` (no Mathlib), that:
+- every segment is kept `all_days`, or the longest retention past the log;
+- a segment that meets an event is kept that event's days, so no age sweep deletes it sooner;
+- a held segment is never deleted, for age or for space;
+- the space rule frees only what expires no later than everything it keeps.
+
+```bash
+lean proofs/Retention.lean
+```
+
+[`notebooks/motion_record_live.ipynb`](notebooks/motion_record_live.ipynb) is one Colab cell that does all of this on a test clip. It measures the gate against the detector (MCC), runs a box that records and streams, reads it back through `/v1/chat/completions`, sweeps the recordings, and checks the proof. Set `TSB_BRANCH` to try a branch.
 
 ## Many boxes
 
@@ -137,7 +205,7 @@ What was learned building it, on a 2-core CPU with demo data:
 ## Tests
 
 ```bash
-cargo test --release                                   # 28 tests; the 4 that need the model run when these are set:
+cargo test --release                                   # 52 tests; the 5 that need the model run when these are set:
 TAMSERVE_YOLOX_ONNX=yolox_nano.onnx TAMSERVE_DOG_JPG=dog.jpg cargo test --release
 scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs mediamtx and ffmpeg
 ```
@@ -146,14 +214,20 @@ scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs m
   - the config: password files, permissions, URLs with credentials, mistakes;
   - the coordinator over loopback: wrong token, a stalled handshake cut off, changed and replayed messages refused, spreading by capacity, failover, cameras a box doesn't know, a box reconnecting;
   - the tracker tests ported from Python;
-  - the model tests, including that splitting a look across requests changes nothing.
+  - the model tests, including that splitting a look across requests changes nothing;
+  - motion: still pictures, a moving square found where it is, specks, the light changing, the gate holding open;
+  - the gate in the tracker: never quiet changes nothing, quiet cameras cost no looks, what is followed is still followed;
+  - retention: each kind of segment's days, the seconds before and after an event, segments past the log, the space order, pins, a sweep on disk, a bad pins file;
+  - live fan-out: every viewer in order, a slow viewer dropped, the limits;
+  - `tests/recording.rs`: one clip followed with the gate, recorded and watched at once (needs `x264enc` to make the clip).
 - **`scripts/rtsp_test.sh`**, against a real RTSP server that needs a password (all 10 checks pass):
   - four cameras up;
   - a wrong password reported and retried;
   - no password on any command line;
   - Prometheus and OpenAI-compatible endpoints;
   - cameras down with the server and back by themselves;
-  - a coordinator with two boxes, one killed with SIGKILL, its cameras moved in 1.4 s.
+  - a coordinator with two boxes, one killed with SIGKILL, its cameras moved in 1.4 s;
+  - one camera recorded and watched live over RTSP with its password: segments decode on their own, and a camera without `live` has no stream.
 
 ## Not yet tested
 
@@ -161,6 +235,9 @@ scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs m
 - Live cameras other than the local RTSP server above.
 - More than 4 cameras through GStreamer at once.
 - A long soak. Run `bench` and `rtsp_test.sh` on the target box first, then a day-long run with `/metrics` scraped.
+- The motion gate on real night and day footage: tune it with `gate_mcc` per site before using it for safety monitoring.
+- Recording many cameras' main streams to one disk at once, and the sweeper on a disk with months of segments.
+- Live view in a browser: mpegts.js is expected to play `/live/<camera>.ts`, but that hasn't been tried.
 
 ## Licences
 

@@ -6,6 +6,7 @@
 //!   tamserve-boxes run --config cameras.toml
 //!   tamserve-boxes box --config cameras.toml --coordinator 10.0.0.2:7400 --token-file token --name box-a
 //!   tamserve-boxes coordinator --config coordinator.toml
+//!   tamserve-boxes sweep --config cameras.toml [--dry-run]
 //!   tamserve-boxes bench --model yolox_nano_gray.onnx --image picture.pgm --cameras 8 --fps 25
 //!
 //! `run` reads the cameras in its config in this process with GStreamer (the gray plane,
@@ -30,6 +31,7 @@ const USAGE: &str = "usage:
   tamserve-boxes run --config cameras.toml
   tamserve-boxes box --config cameras.toml --coordinator HOST:PORT --token-file F --name NAME [--capacity W]
   tamserve-boxes coordinator --config coordinator.toml
+  tamserve-boxes sweep --config cameras.toml [--dry-run]
   tamserve-boxes bench --model M --image PICTURE.pgm [--cameras 4] [--fps 10] [--seconds 20]
                        [--threads 1] [--requests 1] [--look-every 3] [--separate]";
 
@@ -158,6 +160,30 @@ fn detect(a: &Args) -> Res<()> {
     Ok(())
 }
 
+/// `[motion]` and `[record]`, if the config has them.
+#[cfg(feature = "cameras")]
+fn with_extras(mut runner: tamserve_boxes::runner::Runner, cfg: &tamserve_boxes::config::Config) -> Res<tamserve_boxes::runner::Runner> {
+    if let (Some(opts), Some(m)) = (cfg.motion_options(), &cfg.motion) {
+        runner = runner.with_motion(opts, m.gate, m.hold)?;
+    }
+    if let (Some(policy), Some(r)) = (cfg.retention(), &cfg.record) {
+        runner = runner.with_recording(r.dir.clone(), Duration::from_secs_f64(r.segment_seconds), policy,
+                                       Duration::from_secs_f64(r.sweep_seconds.max(1.0)))?;
+    }
+    Ok(runner)
+}
+
+/// Sweep the recordings now, by the config's `[record]`; print what went as JSON.
+fn sweep(a: &Args) -> Res<()> {
+    let path = a.get("config").ok_or("sweep --config cameras.toml [--dry-run]")?;
+    let (cfg, _) = tamserve_boxes::config::Config::load(path)?;
+    let (Some(policy), Some(r)) = (cfg.retention(), &cfg.record) else { return Err("the config has no [record]".into()) };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as u64;
+    let done = tamserve_boxes::retention::sweep(&r.dir, &policy, now, a.flag("dry-run"))?;
+    println!("{}", serde_json::to_string(&done)?);
+    Ok(())
+}
+
 /// Log a camera's state when it changes: its name and host only, never its address.
 #[cfg(feature = "cameras")]
 fn log_changes(shared: &tamserve_boxes::runner::Shared, last: &mut HashMap<String, &'static str>) {
@@ -180,7 +206,7 @@ fn run(a: &Args) -> Res<()> {
     }
     camera::init(cfg.decode.decoder)?;
     let tracker = BoxTracker::from_model(&cfg.detector.model, cfg.detector_options(), cfg.tracker_options(&cams))?;
-    let mut runner = Runner::new(tracker, camera::Opening::from(&cfg.decode));
+    let mut runner = with_extras(Runner::new(tracker, camera::Opening::from(&cfg.decode)), &cfg)?;
     runner.set_cameras(&cams)?;
     if let Some(l) = &cfg.http.listen {
         let base = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));
@@ -307,8 +333,9 @@ fn bench(a: &Args) -> Res<()> {
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let result = match argv.first().map(|s| s.as_str()) {
-        Some(cmd @ ("fold" | "detect" | "run" | "bench" | "box" | "coordinator")) => {
-            Args::parse(&argv[1..], &["separate"]).and_then(|a| match cmd {
+        Some(cmd @ ("fold" | "detect" | "run" | "bench" | "box" | "coordinator" | "sweep")) => {
+            Args::parse(&argv[1..], &["separate", "dry-run"]).and_then(|a| match cmd {
+                "sweep" => sweep(&a),
                 "fold" => fold(&a),
                 "detect" => detect(&a),
                 "run" => run(&a),
@@ -340,7 +367,7 @@ fn run_box(a: &Args) -> Res<()> {
     let capacity: f64 = a.num("capacity", cams.iter().map(|c| c.weight).sum::<f64>())?;
     camera::init(cfg.decode.decoder)?;
     let tracker = BoxTracker::from_model(&cfg.detector.model, cfg.detector_options(), cfg.tracker_options(&cams))?;
-    let mut runner = Runner::new(tracker, camera::Opening::from(&cfg.decode));
+    let mut runner = with_extras(Runner::new(tracker, camera::Opening::from(&cfg.decode)), &cfg)?;
     let shared = runner.shared.clone();
     if let Some(l) = &cfg.http.listen {
         let base = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));
