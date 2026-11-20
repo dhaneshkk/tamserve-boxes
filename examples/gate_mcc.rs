@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts = MotionOptions { threshold: a.get(4).map(|s| s.parse()).transpose()?.unwrap_or(30), ..Default::default() };
     let mut det = Detector::new(model, DetectorOptions { threads: Some(2), ..Default::default() })?;
     camera::init(Default::default())?;
-    let cam = Camera { name: "eval".into(), url: video.clone(), user: None, password: None, look_every: None, weight: 1.0,
+    let cam = Camera { name: "eval".into(), url: video.clone(), onvif: None, user: None, password: None, look_every: None, weight: 1.0,
                        record: false, live: false, encode: false, motion_mask: Vec::new() };
     let bell = Arc::new(Bell::default());
     // At the file's own frame rate, as a camera sends it; frames that arrive while the

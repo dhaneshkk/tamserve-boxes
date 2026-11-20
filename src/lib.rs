@@ -45,6 +45,8 @@ pub mod motion;
 pub mod regions;
 pub mod restream;
 pub mod retention;
+#[cfg(feature = "onvif")]
+pub mod onvif;
 #[cfg(feature = "cameras")]
 pub mod runner;
 mod tracker;

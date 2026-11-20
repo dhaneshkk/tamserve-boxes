@@ -11,7 +11,10 @@ repository = "https://github.com/dhaneshkk/tamserve-boxes"
 fold = ["dep:onnx-protobuf", "dep:protobuf"]
 # cameras: read cameras in this process with GStreamer (RTSP, files; VA-API decoding where the box has it).
 cameras = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:libc"]
-default = ["fold", "cameras"]
+# onvif: find cameras and their streams over ONVIF (Profile T, Media1 for older cameras): `onvif = "host"`
+# in place of `url` in a camera's config, and `tamserve-boxes onvif` to list a network's cameras.
+onvif = ["cameras", "dep:onvif-rs", "dep:onvif-schema", "dep:tokio", "dep:url", "dep:chrono", "dep:futures-util", "dep:reqwest"]
+default = ["fold", "cameras", "onvif"]
 
 [dependencies]
 # OpenVINO's C library is loaded at run time: put its folder on LD_LIBRARY_PATH or set OPENVINO_INSTALL_DIR.
@@ -28,6 +31,15 @@ toml = "0.9"
 hmac = "0.12"
 sha2 = "0.10"
 getrandom = "0.3"
+# ONVIF: dhaneshkk/onvif-rs with its review fixes (certificate checks, no UsernameToken over plain HTTP,
+# safe redirects, bounded responses), pinned. Move to its main once fix/review-findings is merged.
+onvif-rs = { package = "onvif", git = "https://github.com/dhaneshkk/onvif-rs", rev = "6399316ba8f50661287f0eb98cb188eede221886", features = ["tls"], optional = true }
+onvif-schema = { package = "schema", git = "https://github.com/dhaneshkk/onvif-rs", rev = "6399316ba8f50661287f0eb98cb188eede221886", default-features = false, features = ["devicemgmt", "media", "media2"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time"], optional = true }
+url = { version = "2", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true }
+reqwest = { version = "0.13", default-features = false, optional = true }  # onvif-rs's, for its Certificate type
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg"] }

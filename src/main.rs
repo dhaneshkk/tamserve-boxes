@@ -8,6 +8,10 @@
 //!   tamserve-boxes coordinator --config coordinator.toml
 //!   tamserve-boxes sweep --config cameras.toml [--dry-run]
 //!   tamserve-boxes bench --model yolox_nano_gray.onnx --image picture.pgm --cameras 8 --fps 25
+//!   tamserve-boxes onvif --user viewer --password-file pw [--subnet 10.0.0.0/24] [--device 10.0.0.21]
+//!
+//! `onvif` finds the cameras on the network and prints a `[[camera]]` block for each, with
+//! its streams and the gray and colour picks, ready for cameras.toml.
 //!
 //! `run` reads the cameras in its config in this process with GStreamer (the gray plane,
 //! the newest frame only, reconnecting with backoff), and prints one JSON line per camera
@@ -33,7 +37,9 @@ const USAGE: &str = "usage:
   tamserve-boxes coordinator --config coordinator.toml
   tamserve-boxes sweep --config cameras.toml [--dry-run]
   tamserve-boxes bench --model M --image PICTURE.pgm [--cameras 4] [--fps 10] [--seconds 20]
-                       [--threads 1] [--requests 1] [--look-every 3] [--separate]";
+                       [--threads 1] [--requests 1] [--look-every 3] [--separate]
+  tamserve-boxes onvif [--user U (--password-file F | --password-env VAR)] [--subnet 10.0.0.0/24]
+                       [--device HOST ...] [--seconds 3] [--min-width 640] [--allow-username-token-over-http]";
 
 /// Options as `--key value`, repeatable, and the arguments that are not options.
 struct Args {
@@ -384,17 +390,114 @@ fn bench(a: &Args) -> Res<()> {
     Ok(())
 }
 
+/// `10.0.0.0/24` as (network, mask).
+#[cfg(feature = "onvif")]
+fn subnet(s: &str) -> Res<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+    let (ip, bits) = s.split_once('/').ok_or("--subnet: give it as 10.0.0.0/24")?;
+    let ip: std::net::Ipv4Addr = ip.parse().map_err(|_| format!("--subnet: {ip:?} is not an IPv4 address"))?;
+    let bits: u32 = bits.parse().ok().filter(|b| (16..=32).contains(b))
+        .ok_or("--subnet: the prefix must be 16 to 32 (a /16 is 65534 hosts)")?;
+    let mask = if bits == 32 { u32::MAX } else { !(u32::MAX >> bits) };
+    Ok((std::net::Ipv4Addr::from(u32::from(ip) & mask), std::net::Ipv4Addr::from(mask)))
+}
+
+/// A TOML string.
+#[cfg(feature = "onvif")]
+fn toml_str(s: &str) -> String {
+    toml::Value::String(s.to_string()).to_string()
+}
+
+#[cfg(feature = "onvif")]
+fn onvif(a: &Args) -> Res<()> {
+    use tamserve_boxes::onvif::{self, Options, Want};
+
+    let user = a.get("user");
+    let password = match (a.get("password-file"), a.get("password-env")) {
+        (Some(_), Some(_)) => return Err("give one of --password-file and --password-env".into()),
+        (Some(f), None) => Some(tamserve_boxes::config::read_password_file(std::path::Path::new(f))?),
+        (None, Some(v)) => Some(std::env::var(v).map_err(|_| format!("${v} is not set"))?),
+        (None, None) => None,
+    };
+    if password.is_some() && user.is_none() {
+        return Err("a password needs --user".into());
+    }
+    let options = Options {
+        allow_username_token_over_http: a.flag("allow-username-token-over-http"),
+        min_width: a.get("min-width").map(|w| w.parse()).transpose().map_err(|_| "--min-width is not a number")?,
+        ..Default::default()
+    };
+
+    let devices: Vec<(String, Option<String>)> = match a.opts.get("device") {
+        Some(given) => given.iter().map(|d| (d.clone(), None)).collect(),
+        None => {
+            let wait = Duration::from_secs_f64(a.num("seconds", 3.0)?);
+            let net = a.get("subnet").map(subnet).transpose()?;
+            let found = onvif::block_on(onvif::discover(wait, net))??;
+            if found.is_empty() {
+                eprintln!("no ONVIF devices answered; try --subnet if the network drops multicast, or --device HOST");
+            }
+            found.into_iter().filter_map(|f| {
+                let what = [f.name, f.hardware].into_iter().flatten().collect::<Vec<_>>().join(" ");
+                Some((f.urls.first()?.clone(), Some(what)))
+            }).collect()
+        }
+    };
+
+    for (device, what) in devices {
+        let url = onvif::device_url(&device)?;
+        let host = url.host_str().unwrap_or("camera").replace(['.', ':'], "-");
+        println!("# {}{}", url, what.filter(|w| !w.is_empty()).map(|w| format!("  {w}")).unwrap_or_default());
+        let profiles = match onvif::block_on(onvif::profiles(&url, user, password.as_deref(), &options))? {
+            Ok(p) => p,
+            Err(e) => {
+                println!("# could not list its streams: {e}\n");
+                continue;
+            }
+        };
+        for p in &profiles {
+            let fps = p.fps.map(|f| format!(" {f:.0} fps")).unwrap_or_default();
+            println!("#   {} {:?}  {} {}x{}{fps}  {}", p.token, p.name, p.encoding, p.width, p.height, p.uri);
+        }
+        let gray = onvif::pick(&profiles, &Want::Gray, options.min_width);
+        let colour = onvif::pick(&profiles, &Want::Colour, options.min_width);
+        if let Some(c) = colour {
+            println!("# colour: {} ({}x{})", c.token, c.width, c.height);
+        }
+        println!("[[camera]]\nname = {}\nonvif = {}", toml_str(&format!("cam-{host}")), toml_str(url.as_str()));
+        match gray {
+            Some(g) => println!("stream = \"gray\"   # {} {:?}, {} {}x{}", g.token, g.name, g.encoding, g.width, g.height),
+            None => println!("stream = \"gray\""),
+        }
+        if let Some(u) = user {
+            println!("user = {}", toml_str(u));
+        }
+        if let Some(f) = a.get("password-file") {
+            println!("password_file = {}", toml_str(f));
+        } else if let Some(v) = a.get("password-env") {
+            println!("password_env = {}", toml_str(v));
+        }
+        println!();
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "onvif"))]
+fn onvif(_: &Args) -> Res<()> {
+    Err("this tamserve-boxes was built without the onvif feature".into())
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let result = match argv.first().map(|s| s.as_str()) {
-        Some(cmd @ ("fold" | "detect" | "run" | "bench" | "box" | "coordinator" | "sweep")) => {
-            Args::parse(&argv[1..], &["separate", "dry-run"]).and_then(|a| match cmd {
+        Some(cmd @ ("fold" | "detect" | "run" | "bench" | "box" | "coordinator" | "sweep" | "onvif")) => {
+            Args::parse(&argv[1..], &["separate", "dry-run", "allow-username-token-over-http"]).and_then(|a| match cmd {
                 "sweep" => sweep(&a),
                 "fold" => fold(&a),
                 "detect" => detect(&a),
                 "run" => run(&a),
                 "box" => run_box(&a),
                 "coordinator" => coordinator(&a),
+                "onvif" => onvif(&a),
                 _ => bench(&a),
             })
         }
