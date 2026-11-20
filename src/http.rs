@@ -6,12 +6,17 @@
 //!   is a camera's name (or `"all"`), and the answer's message is that camera's latest
 //!   objects and health as JSON, so any OpenAI client can read the analytics.
 //!
+//! - `GET /live/<camera>.ts`: a camera with `live = true`, as MPEG-TS, from the box's own
+//!   connection to it (see `restream`). At most 8 live viewers per box.
+//!
 //! It binds where the config says (127.0.0.1 by default), reads each request with a 5 s
 //! deadline and at most 1 MB of body, and with `token_file` set requires
-//! `Authorization: Bearer <token>`.
+//! `Authorization: Bearer <token>`, live streams included.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,23 +28,37 @@ use crate::{Error, Result};
 pub trait Source: Send + Sync + 'static {
     fn metrics(&self) -> String;
     fn status(&self) -> Value;
+    /// A camera's live stream, if it has one.
+    fn live(&self, _camera: &str) -> std::result::Result<Receiver<crate::restream::Chunk>, LiveRefused> {
+        Err(LiveRefused::NoSuchStream)
+    }
 }
+
+/// Why a live stream was not given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveRefused {
+    NoSuchStream,
+    Full,
+}
+
+const MOST_LIVE: usize = 8;
 
 /// Serve `src` on `listen` in the background.
 pub fn serve(listen: &str, token: Option<String>, src: Arc<dyn Source>) -> Result<std::net::SocketAddr> {
     let l = TcpListener::bind(listen).map_err(|e| Error::Invalid(format!("cannot listen on {listen}: {e}")))?;
     let addr = l.local_addr()?;
-    let busy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let busy = Arc::new(AtomicUsize::new(0));
+    let live = Arc::new(AtomicUsize::new(0));
     std::thread::Builder::new().name("http".into()).spawn(move || {
         for conn in l.incoming().flatten() {
-            if busy.load(std::sync::atomic::Ordering::Relaxed) >= 16 {
+            if busy.load(Ordering::Relaxed) >= 16 {
                 continue; // dropped: too many at once
             }
-            let (src, token, busy) = (src.clone(), token.clone(), busy.clone());
-            busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (src, token, busy, live) = (src.clone(), token.clone(), busy.clone(), live.clone());
+            busy.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
-                let _ = handle(conn, token.as_deref(), &*src);
-                busy.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = handle(conn, token.as_deref(), &*src, &busy, &live);
+                busy.fetch_sub(1, Ordering::Relaxed);
             });
         }
     })?;
@@ -47,12 +66,31 @@ pub fn serve(listen: &str, token: Option<String>, src: Arc<dyn Source>) -> Resul
 }
 
 fn reply(mut s: &TcpStream, code: u16, kind: &str, body: &str) -> std::io::Result<()> {
-    let reason = match code { 200 => "OK", 400 => "Bad Request", 401 => "Unauthorized", 404 => "Not Found", _ => "Error" };
+    let reason = match code { 200 => "OK", 400 => "Bad Request", 401 => "Unauthorized", 404 => "Not Found",
+                              503 => "Service Unavailable", _ => "Error" };
     write!(s, "HTTP/1.1 {code} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
            body.len())
 }
 
-fn handle(stream: TcpStream, token: Option<&str>, src: &dyn Source) -> std::io::Result<()> {
+/// Send a live stream until the viewer leaves, falls behind, or the camera sends nothing
+/// for 30 s. A live viewer does not count against the 16 requests at once.
+fn stream_live(mut s: &TcpStream, rx: Receiver<crate::restream::Chunk>, busy: &AtomicUsize, live: &AtomicUsize) -> std::io::Result<()> {
+    busy.fetch_sub(1, Ordering::Relaxed);
+    let result = (|| {
+        write!(s, "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")?;
+        loop {
+            match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(chunk) => s.write_all(&chunk)?,
+                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        }
+    })();
+    live.fetch_sub(1, Ordering::Relaxed);
+    busy.fetch_add(1, Ordering::Relaxed);
+    result
+}
+
+fn handle(stream: TcpStream, token: Option<&str>, src: &dyn Source, busy: &AtomicUsize, live: &AtomicUsize) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut r = BufReader::new(&stream).take(1 << 20);
@@ -82,7 +120,24 @@ fn handle(stream: TcpStream, token: Option<&str>, src: &dyn Source) -> std::io::
     }
     let mut body = vec![0u8; length];
     r.read_exact(&mut body)?;
-    match (method, path.split('?').next().unwrap_or("")) {
+    let route = path.split('?').next().unwrap_or("");
+    if let (true, Some(cam)) = (method == "GET", route.strip_prefix("/live/").and_then(|c| c.strip_suffix(".ts"))) {
+        if live.fetch_add(1, Ordering::Relaxed) >= MOST_LIVE {
+            live.fetch_sub(1, Ordering::Relaxed);
+            return reply(&stream, 503, "application/json", r#"{"error":{"message":"too many live viewers on this box"}}"#);
+        }
+        return match src.live(cam) {
+            Ok(rx) => stream_live(&stream, rx, busy, live),
+            Err(why) => {
+                live.fetch_sub(1, Ordering::Relaxed);
+                match why {
+                    LiveRefused::NoSuchStream => reply(&stream, 404, "application/json", r#"{"error":{"message":"no live stream for that camera"}}"#),
+                    LiveRefused::Full => reply(&stream, 503, "application/json", r#"{"error":{"message":"too many viewers of that camera"}}"#),
+                }
+            }
+        };
+    }
+    match (method, route) {
         ("GET", "/metrics") => reply(&stream, 200, "text/plain; version=0.0.4", &src.metrics()),
         ("GET", "/status") => reply(&stream, 200, "application/json", &src.status().to_string()),
         ("GET", "/v1/models") => {

@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hash;
 
 use crate::kalman::Kalman;
+use crate::regions::{self, Regions, Square};
 use crate::{iou, BBox, Detect, Detector, Error, Finds, Found, GrayFrame, Result};
 
 /// Frames between a camera's looks: the same for all, or some cameras' own.
@@ -46,11 +47,14 @@ pub struct TrackerOptions<K = String> {
     /// Finds from this confidence are matched first; weaker ones may only confirm an
     /// object already followed (ByteTrack's second round).
     pub high: f32,
+    /// Crop looks to squares around what moved and what is followed (see
+    /// [`regions`](crate::regions)); None looks at whole frames, as the Python version does.
+    pub regions: Option<Regions>,
 }
 
 impl<K> Default for TrackerOptions<K> {
     fn default() -> Self {
-        TrackerOptions { look_every: LookEvery::All(3), hold: 30, start: 0.6, high: 0.5 }
+        TrackerOptions { look_every: LookEvery::All(3), hold: 30, start: 0.6, high: 0.5, regions: None }
     }
 }
 
@@ -67,11 +71,12 @@ struct Camera {
     since_look: Option<u32>,        // frames since the last look; None before the first
     next_id: u32,
     size: Option<(usize, usize)>,
+    full_next: bool, // a region cut a find: look at the whole frame next time
 }
 
 impl Default for Camera {
     fn default() -> Self {
-        Camera { objects: BTreeMap::new(), since_look: None, next_id: 1, size: None } // ids count from 1
+        Camera { objects: BTreeMap::new(), since_look: None, next_id: 1, size: None, full_next: false } // ids count from 1
     }
 }
 
@@ -82,6 +87,7 @@ pub struct BoxTracker<D: Detect = Detector, K: Eq + Hash + Clone = String> {
     cameras: HashMap<K, Camera>,
     joined: u32, // cameras that have had their first look
     looks: u64,  // frames the detector has been given
+    skipped: Vec<K>, // cameras the latest step did not look at because they were quiet
 }
 
 /// box index -> track index, one to one, the best overlap first, down to `least`.
@@ -142,12 +148,18 @@ impl<K: Eq + Hash + Clone> BoxTracker<Detector, K> {
 impl<D: Detect, K: Eq + Hash + Clone> BoxTracker<D, K> {
     pub fn new(detector: D, opts: TrackerOptions<K>) -> Result<Self> {
         opts.look_every.check()?;
-        Ok(BoxTracker { detector, opts, cameras: HashMap::new(), joined: 0, looks: 0 })
+        Ok(BoxTracker { detector, opts, cameras: HashMap::new(), joined: 0, looks: 0, skipped: Vec::new() })
     }
 
     /// Frames the detector has been given so far.
     pub fn looks(&self) -> u64 {
         self.looks
+    }
+
+    /// The cameras the latest [`step_gated`](BoxTracker::step_gated) would have looked at
+    /// but did not, because they were quiet with nothing followed.
+    pub fn skipped(&self) -> &[K] {
+        &self.skipped
     }
 
     /// Forget a camera.
@@ -158,12 +170,17 @@ impl<D: Detect, K: Eq + Hash + Clone> BoxTracker<D, K> {
     /// The cameras that look this step, spread as tamserve's trackers spread them: a new
     /// camera at once; others once their interval has passed, no more in one step than
     /// the intervals call for on average, those that look most often first.
-    fn due(&self, cams: &[&K]) -> Vec<K> {
+    ///
+    /// A camera that is `quiet` and follows nothing (not even an object on trial or held
+    /// unseen) is left out once it has had its first look, and stays due: it looks on the
+    /// first step that is not quiet.
+    fn due(&mut self, cams: &[&K], quiet: &dyn Fn(&K) -> bool) -> Vec<K> {
         let every = |c: &K| self.opts.look_every.of(c);
         let mut out: Vec<K> = cams.iter().filter(|c| self.cameras[**c].since_look.is_none()).map(|c| (*c).clone()).collect();
-        let mut due: Vec<&K> = cams.iter().copied()
-            .filter(|c| self.cameras[*c].since_look.unwrap_or(0) >= every(c))
-            .collect();
+        let (mut due, idle): (Vec<&K>, Vec<&K>) = cams.iter().copied()
+            .filter(|c| self.cameras[*c].since_look.is_some_and(|s| s >= every(c)))
+            .partition(|c| !(self.cameras[*c].objects.is_empty() && quiet(c)));
+        self.skipped = idle.into_iter().cloned().collect();
         due.sort_by_key(|c| (every(c), std::cmp::Reverse(self.cameras[*c].since_look)));
         let cap = looks_per_step(self.cameras.keys().map(every));
         out.extend(due.into_iter().take(cap).cloned());
@@ -173,6 +190,22 @@ impl<D: Detect, K: Eq + Hash + Clone> BoxTracker<D, K> {
     /// `frames`: each camera's newest frame, in any order. Returns, for each camera,
     /// what the latest look on it saw: object id -> [`Found`]. Ids count from 1 on each camera.
     pub fn step(&mut self, frames: &[(K, GrayFrame)]) -> Result<HashMap<K, BTreeMap<u32, Found>>> {
+        self.step_gated(frames, &|_| false)
+    }
+
+    /// [`step`](BoxTracker::step), but a camera for which `quiet` is true, and that follows
+    /// nothing, is not looked at: its frame costs no detection. With `quiet` never true
+    /// this is `step` exactly.
+    pub fn step_gated(&mut self, frames: &[(K, GrayFrame)], quiet: &dyn Fn(&K) -> bool)
+                      -> Result<HashMap<K, BTreeMap<u32, Found>>> {
+        self.step_regions(frames, quiet, &|_| Vec::new())
+    }
+
+    /// [`step_gated`](BoxTracker::step_gated), and with `regions` set, each look cropped to
+    /// squares around `moved(camera)` and the camera's followed objects. Without `regions`
+    /// this is `step_gated`, and `moved` is not asked.
+    pub fn step_regions(&mut self, frames: &[(K, GrayFrame)], quiet: &dyn Fn(&K) -> bool, moved: &dyn Fn(&K) -> Vec<BBox>)
+                        -> Result<HashMap<K, BTreeMap<u32, Found>>> {
         self.opts.look_every.check()?;
         for (c, f) in frames {
             let shape = (f.height, f.width);
@@ -187,13 +220,48 @@ impl<D: Detect, K: Eq + Hash + Clone> BoxTracker<D, K> {
             }
         }
         let cams: Vec<&K> = frames.iter().map(|(c, _)| c).collect();
-        let looking = self.due(&cams);
-        let pictures: Vec<GrayFrame> = looking.iter()
-            .map(|c| frames.iter().find(|(k, _)| k == c).unwrap().1)
-            .collect();
+        let looking = self.due(&cams, quiet);
+        // What each looking camera's look is: its whole frame, or squares of it.
+        let mut pictures: Vec<GrayFrame> = Vec::with_capacity(looking.len());
+        let mut parts: Vec<Option<Vec<Square>>> = Vec::with_capacity(looking.len());
+        for c in &looking {
+            let f = frames.iter().find(|(k, _)| k == c).unwrap().1;
+            let cam = self.cameras.get_mut(c).unwrap();
+            let squares = match &self.opts.regions {
+                Some(r) if cam.since_look.is_some() && !std::mem::take(&mut cam.full_next) => {
+                    let mut around = moved(c);
+                    around.extend(cam.objects.values().map(|o| {
+                        let b = o.kalman.bbox();
+                        [b[0].max(0.0), b[1].max(0.0), b[2].min(f.width as f32), b[3].min(f.height as f32)]
+                    }).filter(|b| b[2] > b[0] && b[3] > b[1]));
+                    regions::plan(f.width, f.height, &around, r)
+                }
+                _ => None,
+            };
+            match &squares {
+                None => pictures.push(f),
+                Some(sq) => pictures.extend(sq.iter().map(|&[x0, y0, side]| {
+                    GrayFrame::with_stride(&f.pixels[y0 * f.stride + x0..], side, side, f.stride).expect("a square inside the frame")
+                })),
+            }
+            parts.push(squares);
+        }
         self.looks += pictures.len() as u64;
-        let found = self.detector.detect(&pictures)?;
-        for (c, finds) in looking.iter().zip(found) {
+        let mut found = self.detector.detect(&pictures)?.into_iter();
+        let mut joined = Vec::with_capacity(looking.len());
+        for (c, squares) in looking.iter().zip(&parts) {
+            match squares {
+                None => joined.push(found.next().unwrap_or_default()),
+                Some(sq) => {
+                    let (w, h) = self.cameras[c].size.map(|(h, w)| (w, h)).unwrap();
+                    let each: Vec<(Finds, Square)> = sq.iter().map(|&s| (found.next().unwrap_or_default(), s)).collect();
+                    let (finds, cut) = regions::join(&each, w, h);
+                    self.cameras.get_mut(c).unwrap().full_next = cut;
+                    joined.push(finds);
+                }
+            }
+        }
+        for (c, finds) in looking.iter().zip(joined) {
             let every = self.opts.look_every.of(c);
             let (high, start, hold) = (self.opts.high, self.opts.start, self.opts.hold);
             let cam = self.cameras.get_mut(c).unwrap();
