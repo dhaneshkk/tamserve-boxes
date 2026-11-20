@@ -10,7 +10,7 @@ repository = "https://github.com/dhaneshkk/tamserve-boxes"
 # fold: make the 1-channel model from YOLOX's own ONNX file (tamserve-boxes fold). Not needed to run one.
 fold = ["dep:onnx-protobuf", "dep:protobuf"]
 # cameras: read cameras in this process with GStreamer (RTSP, files; VA-API decoding where the box has it).
-cameras = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
+cameras = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:libc"]
 # onvif: find cameras and their streams over ONVIF (Profile T, Media1 for older cameras): `onvif = "host"`
 # in place of `url` in a camera's config, and `tamserve-boxes onvif` to list a network's cameras.
 onvif = ["cameras", "dep:onvif-rs", "dep:onvif-schema", "dep:tokio", "dep:url", "dep:chrono", "dep:futures-util", "dep:reqwest"]
@@ -24,6 +24,7 @@ protobuf = { version = "=3.4.0", optional = true }  # the version onnx-protobuf'
 gstreamer = { version = "0.25", optional = true }
 gstreamer-app = { version = "0.25", optional = true }
 gstreamer-video = { version = "0.25", optional = true }
+libc = { version = "0.2", optional = true }  # SIGINT and SIGTERM, to close recordings whole; already under GStreamer
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"

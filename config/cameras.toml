@@ -24,12 +24,43 @@ backoff_max = 30
 listen = "127.0.0.1:9300"        # /metrics (Prometheus), /status, /v1/chat/completions (OpenAI-compatible)
 # token_file = "/etc/tamserve/http.token"
 
+[motion]                         # look only where something moves (and keep motion in recordings)
+hold = 10                        # frames a camera stays awake after it last moved
+# regions = true                 # crop looks around motion and what is followed: for main streams
+
+[record]
+dir = "/var/lib/tamserve/recordings"
+segment_seconds = 10
+all_days = 1                     # every segment
+motion_days = 3                  # with motion
+objects_days = 14                # with any object
+labels = { person = 30 }
+max_gb = 400                     # over this, what would expire first goes first
+# pins: /var/lib/tamserve/recordings/pins.json, [{"camera": "gate", "from": ms, "to": ms}]
+
+[encode]                         # an AV1 uplink copy for cameras with `encode = true`, from detection's decode
+encoder = "svtav1"               # "vah265": HEVC on the integrated GPU, almost no CPU; "x265": HEVC on the CPU
+threads = 1                      # each encoder's threads: 20 encoders x 1 stays inside a 4-core budget
+preset = 12                      # SVT-AV1: 10 to 12 for live CCTV on a small CPU
+bitrate_kbps = 300               # low-delay CBR for the uplink; leave out for constant quality (crf = 40)
+keyframe_seconds = 2
+fps = 10                         # frames a second encoded; the decoder's others still go to detection
+width = 640                      # the uplink can be smaller than what detection sees
+height = 360
+output = "/var/lib/tamserve/uplink/{camera}/%05d.mkv"   # Matroska segments, numbered on after a reconnect
+segment_seconds = 60
+max_files = 1440                 # a day of minute segments per camera
+
 [[camera]]
 name = "gate"
 url = "rtsp://10.0.0.21/Streaming/Channels/102"
 user = "viewer"
 password_file = "/etc/tamserve/secrets/gate"
 look_every = 1                   # this camera's own
+record = true                    # to [record] dir, from this box's one connection
+live = true                      # GET /live/gate.ts on [http]
+encode = true                    # and the [encode] uplink copy
+motion_mask = [[0.75, 0.0, 1.0, 0.08]]   # the clock overlay: no motion there
 
 [[camera]]
 name = "yard"
