@@ -13,7 +13,10 @@ fn inputs() -> Option<(String, Vec<u8>, usize, usize)> {
 }
 
 fn gray_model(src: &str) -> std::path::PathBuf {
-    let dst = std::env::temp_dir().join(format!("tamserve-boxes-test-{}.onnx", std::process::id()));
+    // One file per call: the tests run at once, and one must not read another's half-written model.
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dst = std::env::temp_dir().join(format!("tamserve-boxes-test-{}-{n}.onnx", std::process::id()));
     tamserve_boxes::fold::gray_model(src, &dst).unwrap();
     dst
 }
