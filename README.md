@@ -34,6 +34,7 @@ export LD_LIBRARY_PATH=~/.local/lib/openvino:$OV
 Features:
 - `fold` (on by default): makes the 1-channel model. Needs `onnx-protobuf`, which is MPL-2.0.
 - `cameras` (on by default): GStreamer, the runner and the coordinator.
+- `onvif` (on by default): finds cameras and their streams over ONVIF. Uses [dhaneshkk/onvif-rs](https://github.com/dhaneshkk/onvif-rs), pinned to a commit, and OpenSSL through `native-tls` (`libssl-dev`).
 
 `--no-default-features` builds the detector and tracker alone.
 
@@ -51,6 +52,57 @@ tamserve-boxes run --config cameras.toml
 - `password`: in the config itself, which then must be mode 600.
 
 A URL with `user:pass@` in it is refused.
+
+### ONVIF cameras
+
+A camera can give its ONVIF device in place of `url`. The box then asks the camera for its stream (Profile T through Media2; Media1 for older cameras) **every time it opens the stream**. So a camera that was replaced, reset, or moved to another address by its own DHCP lease is followed without editing the config.
+
+```toml
+[onvif]
+timeout_seconds = 5
+use_device_host = true    # default: reach the streams at the address the camera was reached at
+# allow_username_token_over_http = true   # only for cameras with no Digest login
+# ca_file = "/etc/tamserve/site-ca.pem"   # for https:// devices
+
+[[camera]]
+name = "yard"
+onvif = "10.0.0.22"       # or "http://10.0.0.22/onvif/device_service"
+stream = "gray"           # "gray" (the default), "colour", or a profile's token or name
+user = "viewer"
+password_file = "/etc/tamserve/secrets/yard"
+```
+
+ONVIF doesn't mark which stream is monochrome, so `stream` picks a profile as follows:
+- **`gray`:** a profile named gray, grey or mono. Otherwise, the smallest H.264/H.265 stream at least `[decode] width` wide (the sub-stream, usually). The detector reads the gray plane of any stream, so the cheapest one that's big enough is the right one.
+- **`colour`:** a profile named colour or color. Otherwise, the biggest stream not named gray (the main stream).
+- **Any other value:** that profile's token, or its name with letter case ignored.
+
+The `tamserve-boxes onvif` command finds the cameras on the network. It prints each camera's streams, then a `[[camera]]` block to paste into `cameras.toml`. For example:
+
+```bash
+tamserve-boxes onvif --user viewer --password-file /etc/tamserve/secrets/site --min-width 640
+tamserve-boxes onvif --subnet 10.0.0.0/24 ...   # networks that drop multicast: ask every host
+tamserve-boxes onvif --device 10.0.0.21 ...     # skip discovery
+```
+
+```toml
+# http://10.0.0.21/onvif/device_service  HIKVISION DS-2CD2143G2-I
+#   Profile_101 "mainStream"  H265 2560x1440 25 fps  rtsp://10.0.0.21:554/Streaming/Channels/101?transportmode=unicast
+#   Profile_102 "subStream"  H264 640x360 25 fps  rtsp://10.0.0.21:554/Streaming/Channels/102?transportmode=unicast
+# colour: Profile_101 (2560x1440)
+[[camera]]
+name = "cam-10-0-0-21"
+onvif = "http://10.0.0.21/onvif/device_service"
+stream = "gray"   # Profile_102 "subStream", H264 640x360
+user = "viewer"
+password_file = "/etc/tamserve/secrets/site"
+```
+
+How credentials are handled:
+- The ONVIF login uses the camera's `user` and password. HTTPS certificates are checked: trust a site CA, or pin the cameras' own certificates, with `ca_file`.
+- The weaker UsernameToken login is not sent over plain HTTP unless `allow_username_token_over_http` is set.
+- Stream URLs the camera reports lose any credentials in them; the RTSP login goes on the source element, as for `url`.
+- With `use_device_host = false`, a camera that names a service on another host is refused, so the password never goes there.
 
 `run` prints one JSON line per camera per step and logs state changes by camera name and host:
 
@@ -171,13 +223,20 @@ To check zram is working, run your normal cameras plus some extra memory pressur
 ## Tests
 
 ```bash
-cargo test --release                                   # 28 tests; the 4 that need the model run when these are set:
+cargo test --release                                   # the 4 tests that need the model run when these are set:
 TAMSERVE_YOLOX_ONNX=yolox_nano.onnx TAMSERVE_DOG_JPG=dog.jpg cargo test --release
 scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs mediamtx and ffmpeg
 ```
 
 - **Unit and integration tests:**
-  - the config: password files, permissions, URLs with credentials, mistakes;
+  - the config: password files, permissions, URLs with credentials, mistakes, `onvif` cameras;
+  - ONVIF, against a mock camera on localhost:
+    - Media2, and a Media1-only camera without GetServices;
+    - picking the gray and colour streams;
+    - addresses rewritten and credentials stripped;
+    - services on another host refused;
+    - the `onvif` command's output loading as a config;
+    - a camera source that looks its stream up over ONVIF and decodes it;
   - the coordinator over loopback: wrong token, a stalled handshake cut off, changed and replayed messages refused, spreading by capacity, failover, cameras a box doesn't know, a box reconnecting;
   - the tracker tests ported from Python;
   - the model tests, including that splitting a look across requests changes nothing.
@@ -192,7 +251,7 @@ scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs m
 ## Not yet tested
 
 - VA-API decoding on an Intel GPU, and everything on an N100.
-- Live cameras other than the local RTSP server above.
+- Live cameras other than the local RTSP server above. ONVIF is tested only against the mock camera; WS-Discovery has not been tried on a real camera network.
 - More than 4 cameras through GStreamer at once.
 - A long soak. Run `bench` and `rtsp_test.sh` on the target box first, then a day-long run with `/metrics` scraped.
 - `deploy/setup-zram.sh` on real Ubuntu. It passes shellcheck, but the machine this was built on has no zram module. Run `--check` before and after on the target box.

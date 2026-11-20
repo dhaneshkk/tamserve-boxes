@@ -239,14 +239,15 @@ pub struct Source {
 impl Source {
     /// Start reading `camera`; frames ring `bell`.
     pub fn open(camera: Camera, how: &Opening, bell: Arc<Bell>) -> Result<Source> {
-        let target = uri(&camera.url)?;
+        // An ONVIF camera's stream is looked up each time it is opened.
+        let target = if camera.onvif.is_some() { None } else { Some(uri(&camera.url)?) };
         let health = Arc::new(Health::default());
         let newest = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let (h, n, s, cam, how) = (health.clone(), newest.clone(), stop.clone(), camera.clone(), how.clone());
         let thread = std::thread::Builder::new()
             .name(format!("camera {}", camera.name))
-            .spawn(move || supervise(&cam, &target, &how, &h, &n, &s, &bell))
+            .spawn(move || supervise(&cam, target.as_deref(), &how, &h, &n, &s, &bell))
             .map_err(Error::Io)?;
         Ok(Source { camera, health, newest, stop, thread: Some(thread) })
     }
@@ -267,16 +268,36 @@ impl Drop for Source {
     }
 }
 
+/// What to open for `camera`: `target`, or for an ONVIF camera the stream it reports now.
+#[cfg_attr(not(feature = "onvif"), allow(unused_variables))]
+fn current_target(camera: &Camera, target: Option<&str>) -> std::result::Result<String, String> {
+    if let Some(t) = target {
+        return Ok(t.to_string());
+    }
+    #[cfg(feature = "onvif")]
+    if let Some(o) = &camera.onvif {
+        let options = crate::onvif::Options::from(o);
+        return crate::onvif::resolve(&o.device, &crate::onvif::Want::parse(&o.stream),
+                                     camera.user.as_deref(), camera.password.as_deref(), &options)
+            .map_err(|e| format!("ONVIF: {e}"));
+    }
+    Err("no stream to open".into())
+}
+
 /// Keep `camera` open until told to stop: open, read, and on failure or a stall wait
-/// the backoff and open again. A file is read once.
-fn supervise(camera: &Camera, target: &str, how: &Opening, health: &Arc<Health>, newest: &Arc<Mutex<Option<Frame>>>,
+/// the backoff and open again. A file is read once. An ONVIF camera's stream is looked up
+/// on the camera before each attempt.
+fn supervise(camera: &Camera, target: Option<&str>, how: &Opening, health: &Arc<Health>, newest: &Arc<Mutex<Option<Frame>>>,
              stop: &AtomicBool, bell: &Arc<Bell>) {
     let mut failures = 0u32;
     while !stop.load(Ordering::Relaxed) {
         health.set(State::Connecting);
         health.generation.fetch_add(1, Ordering::Relaxed);
         let opened = Instant::now();
-        let outcome = stream(camera, target, how, health, newest, stop, bell);
+        let outcome = match current_target(camera, target) {
+            Ok(t) => stream(camera, &t, how, health, newest, stop, bell),
+            Err(why) => Outcome::Failed(why),
+        };
         health.up_since_ms.store(0, Ordering::Relaxed);
         match outcome {
             Outcome::Stopped => break,

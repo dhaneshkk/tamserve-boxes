@@ -19,7 +19,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav libssl-dev pkg-config
       - name: OpenVINO's C library (from the pip wheel, under the name the bindings look for)
         run: |
           pip install -q "openvino>=2024.0"
@@ -41,3 +41,5 @@ jobs:
       - run: cargo test --release
       - name: Without the optional features
         run: cargo build --release --no-default-features
+      - name: Cameras without ONVIF
+        run: cargo test --release --no-default-features --features fold,cameras

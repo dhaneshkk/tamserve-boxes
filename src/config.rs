@@ -28,6 +28,24 @@
 //! look_every = 1                                  # this camera's own
 //! ```
 //!
+//! A camera can name its ONVIF device instead of a URL (feature `onvif`); its stream is
+//! then looked up on the camera each time it is opened:
+//!
+//! ```toml
+//! [onvif]
+//! timeout_seconds = 5
+//! use_device_host = true        # reach streams at the address the camera was reached at
+//! # allow_username_token_over_http = false
+//! # ca_file = "/etc/tamserve/site-ca.pem"   # for https:// devices
+//!
+//! [[camera]]
+//! name = "yard"
+//! onvif = "10.0.0.22"           # or "http://10.0.0.22/onvif/device_service"
+//! stream = "gray"               # "gray" (default), "colour", or a profile's token or name
+//! user = "viewer"
+//! password_env = "YARD_PASSWORD"
+//! ```
+//!
 //! A password can come from a file (`password_file`), from the environment
 //! (`password_env`), or be written in this file (`password`). A file holding a password,
 //! this one included, must be readable by its owner only (mode 600 or stricter):
@@ -105,11 +123,34 @@ pub struct HttpSection {
     pub token_file: Option<PathBuf>,
 }
 
+/// How cameras given by `onvif` are reached.
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OnvifSection {
+    /// How long one ONVIF request may take (default 5).
+    pub timeout_seconds: Option<f64>,
+    /// Use the address the camera was reached at in the stream URLs it reports (default true).
+    pub use_device_host: Option<bool>,
+    /// Allow UsernameToken logins over plain HTTP, for cameras that support nothing else.
+    #[serde(default)]
+    pub allow_username_token_over_http: bool,
+    /// Certificates to trust for `https://` devices (PEM): a site CA or the cameras' own.
+    pub ca_file: Option<PathBuf>,
+    /// Accept a trusted certificate that does not name the camera's address.
+    #[serde(default)]
+    pub accept_invalid_hostnames: bool,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct CameraSection {
     pub name: String,
-    pub url: String,
+    /// The stream to open: rtsp://..., a file, or anything GStreamer opens. Or `onvif`.
+    pub url: Option<String>,
+    /// The camera's ONVIF device, a host or its device service URL, in place of `url`.
+    pub onvif: Option<String>,
+    /// Which of the ONVIF camera's streams: "gray" (default), "colour", or a profile.
+    pub stream: Option<String>,
     pub user: Option<String>,
     pub password: Option<String>,
     pub password_file: Option<PathBuf>,
@@ -129,6 +170,8 @@ pub struct Config {
     pub decode: DecodeSection,
     #[serde(default)]
     pub http: HttpSection,
+    #[serde(default)]
+    pub onvif: OnvifSection,
     #[serde(default, rename = "camera")]
     pub cameras: Vec<CameraSection>,
 }
@@ -140,11 +183,25 @@ fn size() -> usize {
     416
 }
 
+/// A camera found through ONVIF: which stream to ask it for, and how.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OnvifCamera {
+    /// The device: a host or its device service URL.
+    pub device: String,
+    pub stream: String,
+    pub section: OnvifSection,
+    /// `[decode] width`, the least the gray stream should be.
+    pub min_width: Option<u32>,
+}
+
 /// A camera ready to open: its address without credentials, and the credentials apart.
 #[derive(Clone)]
 pub struct Camera {
     pub name: String,
+    /// The stream to open; for an ONVIF camera, its device, until the stream is looked up.
     pub url: String,
+    /// Set when the stream is looked up on the camera over ONVIF.
+    pub onvif: Option<OnvifCamera>,
     pub user: Option<String>,
     pub password: Option<String>,
     pub look_every: Option<u32>,
@@ -191,6 +248,12 @@ fn owner_only(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A camera password from `path`, which only its owner may read; without the line end.
+pub fn read_password_file(path: &Path) -> Result<String> {
+    owner_only(path)?;
+    Ok(std::fs::read_to_string(path)?.trim_end_matches(['\r', '\n']).to_string())
+}
+
 #[cfg(unix)]
 fn process_uid() -> u32 {
     // The uid of this process, read from /proc to avoid a libc dependency.
@@ -212,6 +275,11 @@ impl Config {
         if cfg.detector.requests == 0 {
             return Err(Error::Invalid("detector.requests must be at least 1".into()));
         }
+        if let Some(t) = cfg.onvif.timeout_seconds {
+            if !(t.is_finite() && t > 0.0) {
+                return Err(Error::Invalid("onvif.timeout_seconds must be more than 0".into()));
+            }
+        }
         let mut seen = std::collections::HashSet::new();
         let mut cams = Vec::with_capacity(cfg.cameras.len());
         let mut inline = false;
@@ -219,7 +287,27 @@ impl Config {
             if !seen.insert(c.name.clone()) {
                 return Err(Error::Invalid(format!("two cameras are named {:?}", c.name)));
             }
-            if let Some(rest) = c.url.split_once("://").map(|x| x.1) {
+            let (url, onvif) = match (&c.url, &c.onvif) {
+                (Some(u), None) => {
+                    if c.stream.is_some() {
+                        return Err(Error::Invalid(format!("camera {:?}: `stream` goes with `onvif`, not `url`", c.name)));
+                    }
+                    (u.clone(), None)
+                }
+                (None, Some(d)) => {
+                    if !cfg!(feature = "onvif") {
+                        return Err(Error::Invalid(format!(
+                            "camera {:?}: `onvif` needs tamserve-boxes built with the onvif feature", c.name)));
+                    }
+                    let o = OnvifCamera { device: d.clone(), stream: c.stream.clone().unwrap_or_else(|| "gray".into()),
+                                          section: cfg.onvif.clone(), min_width: cfg.decode.width };
+                    #[cfg(feature = "onvif")]
+                    crate::onvif::device_url(d).map_err(|e| Error::Invalid(format!("camera {:?}: {e}", c.name)))?;
+                    (d.clone(), Some(o))
+                }
+                _ => return Err(Error::Invalid(format!("camera {:?}: give one of `url` and `onvif`", c.name))),
+            };
+            if let Some(rest) = url.split_once("://").map(|x| x.1) {
                 if rest.split('/').next().unwrap_or("").contains('@') {
                     return Err(Error::Invalid(format!(
                         "camera {:?}: put the user and password in `user` and `password_file`, not in the URL", c.name)));
@@ -234,8 +322,7 @@ impl Config {
                 Some(p.clone())
             } else if let Some(f) = &c.password_file {
                 let f = if f.is_relative() { base.join(f) } else { f.clone() };
-                owner_only(&f)?;
-                Some(std::fs::read_to_string(&f)?.trim_end_matches(['\r', '\n']).to_string())
+                Some(read_password_file(&f)?)
             } else if let Some(v) = &c.password_env {
                 Some(std::env::var(v).map_err(|_| Error::Invalid(format!("camera {:?}: ${v} is not set", c.name)))?)
             } else {
@@ -247,11 +334,21 @@ impl Config {
             if let Some(0) = c.look_every {
                 return Err(Error::Invalid(format!("camera {:?}: look_every must be at least 1", c.name)));
             }
-            cams.push(Camera { name: c.name.clone(), url: c.url.clone(), user: c.user.clone(), password,
+            cams.push(Camera { name: c.name.clone(), url, onvif, user: c.user.clone(), password,
                                look_every: c.look_every, weight: c.weight.unwrap_or(1.0) });
         }
         if inline {
             owner_only(path)?;
+        }
+        if let Some(f) = &cfg.onvif.ca_file {
+            if f.is_relative() {
+                let f = base.join(f);
+                for c in &mut cams {
+                    if let Some(o) = &mut c.onvif {
+                        o.section.ca_file = Some(f.clone());
+                    }
+                }
+            }
         }
         if let Some(t) = &cfg.http.token_file {
             owner_only(&if t.is_relative() { base.join(t) } else { t.clone() })?;
@@ -362,6 +459,52 @@ mod tests {
                      "[[camera]]\nname=\"a\"\nurl=\"rtsp://h/1\"\nlook_every=0\n"] {
             let cfg = write(&d, "c.toml", &format!("{HEAD}{body}"), 0o600);
             assert!(Config::load(&cfg).is_err(), "{body}");
+        }
+    }
+
+    #[cfg(not(feature = "onvif"))]
+    #[test]
+    fn an_onvif_camera_needs_the_feature() {
+        let d = dir();
+        let cfg = write(&d, "c.toml", &format!("{HEAD}[[camera]]\nname=\"a\"\nonvif=\"10.0.0.22\"\n"), 0o600);
+        assert!(Config::load(&cfg).unwrap_err().to_string().contains("onvif feature"));
+    }
+
+    #[cfg(feature = "onvif")]
+    #[test]
+    fn an_onvif_camera_needs_no_url() {
+        let d = dir();
+        let body = "[decode]\nwidth = 640\nheight = 360\n[onvif]\ntimeout_seconds = 2\nca_file = \"site-ca.pem\"\n\
+                    [[camera]]\nname=\"yard\"\nonvif=\"10.0.0.22\"\nstream=\"colour\"\nuser=\"viewer\"\n\
+                    [[camera]]\nname=\"gate\"\nonvif=\"http://10.0.0.21/onvif/device_service\"\n";
+        let cfg = write(&d, "c.toml", &format!("{HEAD}{body}"), 0o600);
+        let (_, cams) = Config::load(&cfg).unwrap();
+        let yard = cams[0].onvif.as_ref().unwrap();
+        assert_eq!((yard.device.as_str(), yard.stream.as_str(), yard.min_width), ("10.0.0.22", "colour", Some(640)));
+        assert_eq!(yard.section.timeout_seconds, Some(2.0));
+        assert_eq!(yard.section.ca_file.as_deref(), Some(d.join("site-ca.pem").as_path()));
+        assert_eq!(cams[0].label(), "yard (10.0.0.22)");
+        // The default stream is the gray one.
+        assert_eq!(cams[1].onvif.as_ref().unwrap().stream, "gray");
+        assert_eq!(cams[1].label(), "gate (10.0.0.21)");
+    }
+
+    #[test]
+    fn onvif_mistakes_are_caught() {
+        let d = dir();
+        for (body, says) in [
+            ("[[camera]]\nname=\"a\"\n", "one of `url` and `onvif`"),
+            ("[[camera]]\nname=\"a\"\nurl=\"rtsp://h/1\"\nonvif=\"h\"\n", "one of `url` and `onvif`"),
+            ("[[camera]]\nname=\"a\"\nurl=\"rtsp://h/1\"\nstream=\"gray\"\n", "goes with `onvif`"),
+            ("[[camera]]\nname=\"a\"\nonvif=\"http://admin:pw@10.0.0.21/\"\n", "not in the URL"),
+            ("[onvif]\ntimeout_seconds = 0\n[[camera]]\nname=\"a\"\nonvif=\"h\"\n", "timeout_seconds"),
+            ("[onvif]\ntimeuot_seconds = 1\n", "unknown field"),
+        ] {
+            let cfg = write(&d, "c.toml", &format!("{HEAD}{body}"), 0o600);
+            let e = Config::load(&cfg).unwrap_err().to_string();
+            if cfg!(feature = "onvif") || !body.contains("onvif=") {
+                assert!(e.contains(says), "{body}: {e}");
+            }
         }
     }
 

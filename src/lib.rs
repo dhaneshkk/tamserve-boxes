@@ -41,6 +41,8 @@ pub mod fold;
 pub mod http;
 pub mod image;
 mod kalman;
+#[cfg(feature = "onvif")]
+pub mod onvif;
 #[cfg(feature = "cameras")]
 pub mod runner;
 mod tracker;

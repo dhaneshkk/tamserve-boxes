@@ -36,3 +36,18 @@ name = "yard"
 url = "rtsp://10.0.0.22/Streaming/Channels/102"
 user = "viewer"
 password_env = "YARD_PASSWORD"
+
+# A camera found through ONVIF (feature onvif): its stream is looked up on the camera each time it is
+# opened. `tamserve-boxes onvif --user viewer --password-file F` lists a network's cameras like this.
+[[camera]]
+name = "dock"
+onvif = "10.0.0.23"              # or "http://10.0.0.23/onvif/device_service"
+stream = "gray"                  # the smallest stream at least [decode] width wide, or a profile named gray
+user = "viewer"
+password_file = "/etc/tamserve/secrets/dock"
+
+# [onvif]
+# timeout_seconds = 5
+# use_device_host = true         # reach streams at the address the camera was reached at, not the one it reports
+# allow_username_token_over_http = false
+# ca_file = "/etc/tamserve/site-ca.pem"   # https:// devices: a site CA, or the cameras' own certificates
