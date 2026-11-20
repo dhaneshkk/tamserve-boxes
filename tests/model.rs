@@ -13,7 +13,10 @@ fn inputs() -> Option<(String, Vec<u8>, usize, usize)> {
 }
 
 fn gray_model(src: &str) -> std::path::PathBuf {
-    let dst = std::env::temp_dir().join(format!("tamserve-boxes-test-{}.onnx", std::process::id()));
+    // One file per call: the tests run at once, and one must not read another's half-written model.
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dst = std::env::temp_dir().join(format!("tamserve-boxes-test-{}-{n}.onnx", std::process::id()));
     tamserve_boxes::fold::gray_model(src, &dst).unwrap();
     dst
 }
@@ -90,4 +93,37 @@ fn splitting_a_look_across_requests_changes_no_frame() {
         let mut many = Detector::new(&path, DetectorOptions { requests, threads: Some(2), ..classes() }).unwrap();
         assert_eq!(many.detect(&frames).unwrap(), want, "{requests} requests");
     }
+}
+
+/// The dog picture shrunk to a third and put on a 1920 x 1080 frame: what a whole-frame
+/// look finds, and what a look cropped to a square around the dog finds.
+#[test]
+fn a_region_finds_what_is_small_on_a_big_frame() {
+    let Some((model, gray, w, h)) = inputs() else { return };
+    let (sw, sh) = (w / 3, h / 3);
+    let mut small = vec![0u8; sw * sh];
+    image::resize_linear(&GrayFrame::new(&gray, w, h).unwrap(), sw, sh, &mut small);
+    let (fw, fh, x0, y0) = (1920, 1080, 1300, 700);
+    let mut frame = vec![120u8; fw * fh];
+    for y in 0..sh {
+        frame[(y0 + y) * fw + x0..(y0 + y) * fw + x0 + sw].copy_from_slice(&small[y * sw..(y + 1) * sw]);
+    }
+    let det = Detector::new(gray_model(&model), classes()).unwrap();
+    let opts = TrackerOptions { look_every: LookEvery::All(1), regions: Some(Default::default()), ..Default::default() };
+    let mut t: BoxTracker<_, &str> = BoxTracker::new(det, opts).unwrap();
+    let f = GrayFrame::new(&frame, fw, fh).unwrap();
+    // Where the dog is in the small picture, a third of [131, 209, 338, 547], moved onto the frame.
+    let dog = [x0 as f32 + 44.0, y0 as f32 + 70.0, x0 as f32 + 113.0, y0 as f32 + 182.0];
+    let whole = t.detector.detect(&[f]).unwrap().remove(0);
+    let whole_dogs = (0..whole.len()).filter(|&i| t.detector.names()[whole.labels[i]] == "dog" && whole.scores[i] > 0.5).count();
+    t.step_regions(&[("cam", f)], &|_| false, &|_| vec![]).unwrap(); // the first look is whole
+    // Something new is on trial until a second look sees it again.
+    t.step_regions(&[("cam", f)], &|_| false, &|_| vec![dog]).unwrap();
+    let seen = t.step_regions(&[("cam", f)], &|_| false, &|_| vec![dog]).unwrap().remove("cam").unwrap();
+    let found: Vec<_> = seen.values().filter(|o| o.label == "dog").collect();
+    eprintln!("whole frame: {whole_dogs} dog(s) over 0.5; cropped: {:?}", found.iter().map(|o| (o.score, o.bbox)).collect::<Vec<_>>());
+    assert_eq!(whole_dogs, 0, "at under a quarter of its size in the whole frame's look, the third-size dog is too small");
+    assert_eq!(found.len(), 1, "followed from the cropped look");
+    // Within what yolox_nano_finds_on_gray_frames allows the dog's box, at a third of it.
+    assert!(found[0].bbox.iter().zip(dog).all(|(a, b)| (a - b).abs() < 25.0), "{:?} vs {dog:?}", found[0].bbox);
 }

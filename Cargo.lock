@@ -2114,6 +2114,7 @@ dependencies = [
  "gstreamer-video",
  "hmac",
  "image",
+ "libc",
  "onnx-protobuf",
  "onvif",
  "openvino",

@@ -26,6 +26,20 @@
 //! user = "admin"
 //! password_file = "/etc/tamserve/secrets/gate"   # or password_env = "GATE_PASSWORD"
 //! look_every = 1                                  # this camera's own
+//! record = true                                   # write segments to [record] dir
+//! live = true                                     # GET /live/gate.ts
+//!
+//! [motion]             # look only where something moves (see `motion`)
+//! hold = 10            # frames a camera stays awake after motion
+//! regions = true       # crop looks around motion (see `regions`)
+//!
+//! [record]             # see `retention`
+//! dir = "/var/lib/tamserve/recordings"
+//! all_days = 1
+//! motion_days = 3
+//! objects_days = 14
+//! labels = { person = 30 }
+//! max_gb = 400
 //! ```
 //!
 //! A camera can name its ONVIF device instead of a URL (feature `onvif`); its stream is
@@ -158,6 +172,87 @@ pub struct CameraSection {
     pub look_every: Option<u32>,
     /// What following this camera costs, against others, for the coordinator (default 1).
     pub weight: Option<f64>,
+    /// Write this camera's stream to `[record] dir` (default: `[record] all_cameras`).
+    pub record: Option<bool>,
+    /// Serve this camera's stream on `GET /live/<name>.ts`.
+    #[serde(default)]
+    pub live: bool,
+    /// Parts of this camera's picture where motion is not looked for:
+    /// [[left, top, right, bottom], ...] as shares of its width and height (0 to 1).
+    #[serde(default)]
+    pub motion_mask: Vec<[f32; 4]>,
+}
+
+/// Motion found before detecting, so that cameras where nothing moves cost no looks.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct MotionSection {
+    /// false: motion is found (for metrics and recording) but every look is made.
+    #[serde(default = "yes")]
+    pub gate: bool,
+    /// Frames a camera stays awake after it last moved.
+    #[serde(default = "ten")]
+    pub hold: u32,
+    pub height: Option<usize>,
+    pub threshold: Option<u8>,
+    pub min_area: Option<usize>,
+    pub alpha: Option<f32>,
+    pub lighting: Option<f32>,
+    /// Crop looks to squares around what moved and what is followed: for main streams,
+    /// where small things are lost in the whole frame.
+    #[serde(default)]
+    pub regions: bool,
+    /// The most squares in one camera's look (default 2).
+    pub most_regions: Option<usize>,
+}
+
+/// Recording, and how long recordings are kept.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct RecordSection {
+    pub dir: PathBuf,
+    /// Record every camera unless it says `record = false`.
+    #[serde(default)]
+    pub all_cameras: bool,
+    #[serde(default = "ten_f")]
+    pub segment_seconds: f64,
+    /// Every segment, in days.
+    #[serde(default = "one_f")]
+    pub all_days: f64,
+    /// Segments with motion (needs `[motion]`).
+    pub motion_days: Option<f64>,
+    /// Segments with any object.
+    pub objects_days: Option<f64>,
+    /// Labels kept for their own days, in place of `objects_days`.
+    #[serde(default)]
+    pub labels: HashMap<String, f64>,
+    #[serde(default = "five_f")]
+    pub pre_seconds: f64,
+    #[serde(default = "five_f")]
+    pub post_seconds: f64,
+    /// The most the recordings may take; the segments that would expire first go.
+    pub max_gb: Option<f64>,
+    #[serde(default = "sixty_f")]
+    pub sweep_seconds: f64,
+}
+
+fn yes() -> bool {
+    true
+}
+fn ten() -> u32 {
+    10
+}
+fn one_f() -> f64 {
+    1.0
+}
+fn five_f() -> f64 {
+    5.0
+}
+fn ten_f() -> f64 {
+    10.0
+}
+fn sixty_f() -> f64 {
+    60.0
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -170,8 +265,8 @@ pub struct Config {
     pub decode: DecodeSection,
     #[serde(default)]
     pub http: HttpSection,
-    #[serde(default)]
-    pub onvif: OnvifSection,
+    pub motion: Option<MotionSection>,
+    pub record: Option<RecordSection>,
     #[serde(default, rename = "camera")]
     pub cameras: Vec<CameraSection>,
 }
@@ -206,6 +301,9 @@ pub struct Camera {
     pub password: Option<String>,
     pub look_every: Option<u32>,
     pub weight: f64,
+    pub record: bool,
+    pub live: bool,
+    pub motion_mask: Vec<[f32; 4]>,
 }
 
 impl std::fmt::Debug for Camera {
@@ -227,6 +325,11 @@ pub fn host(url: &str) -> String {
     let rest = url.split_once("://").map(|x| x.1).unwrap_or(url);
     let rest = rest.rsplit_once('@').map(|x| x.1).unwrap_or(rest);
     rest.split(['/', '?']).next().unwrap_or("").to_string()
+}
+
+/// A name that is safe as a folder and in a URL path.
+fn plain_name(n: &str) -> bool {
+    !n.is_empty() && !n.starts_with('.') && n.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
 }
 
 /// Whether only the owner can read `path` (mode 600, 400 or stricter). Not checked where
@@ -334,8 +437,19 @@ impl Config {
             if let Some(0) = c.look_every {
                 return Err(Error::Invalid(format!("camera {:?}: look_every must be at least 1", c.name)));
             }
-            cams.push(Camera { name: c.name.clone(), url, onvif, user: c.user.clone(), password,
-                               look_every: c.look_every, weight: c.weight.unwrap_or(1.0) });
+            let record = c.record.unwrap_or(cfg.record.as_ref().is_some_and(|r| r.all_cameras));
+            if record && cfg.record.is_none() {
+                return Err(Error::Invalid(format!("camera {:?}: record = true needs a [record] section with a dir", c.name)));
+            }
+            if (record || c.live) && !plain_name(&c.name) {
+                return Err(Error::Invalid(format!(
+                    "camera {:?}: a camera that records or is watched live names a folder and a URL: use letters, digits, `-`, `_` and `.` only", c.name)));
+            }
+            cams.push(Camera { name: c.name.clone(), url: c.url.clone(), user: c.user.clone(), password,
+                               look_every: c.look_every, weight: c.weight.unwrap_or(1.0), record, live: c.live,
+                               motion_mask: c.motion_mask.clone() });
+            crate::motion::MotionOptions { mask: c.motion_mask.clone(), ..Default::default() }.check()
+                .map_err(|e| Error::Invalid(format!("camera {:?}: {e}", c.name)))?;
         }
         if inline {
             owner_only(path)?;
@@ -352,6 +466,23 @@ impl Config {
         }
         if let Some(t) = &cfg.http.token_file {
             owner_only(&if t.is_relative() { base.join(t) } else { t.clone() })?;
+        }
+        if let Some(m) = &cfg.motion {
+            cfg.motion_options_of(m).check()?;
+        }
+        if let Some(r) = &mut cfg.record {
+            if r.dir.is_relative() {
+                r.dir = base.join(&r.dir);
+            }
+            let days = [Some(r.all_days), r.motion_days, r.objects_days].into_iter().flatten().chain(r.labels.values().copied());
+            // Written so that NaN fails too.
+            let ok = |v: f64, least: f64| v >= least;
+            if !ok(r.segment_seconds, 1.0) || days.into_iter().any(|d| !ok(d, 0.0)) || r.max_gb.is_some_and(|g| g <= 0.0 || g.is_nan()) {
+                return Err(Error::Invalid("[record]: segment_seconds must be at least 1, days at least 0, max_gb above 0".into()));
+            }
+            if r.motion_days.is_some() && cfg.motion.is_none() {
+                return Err(Error::Invalid("[record] motion_days needs a [motion] section: motion is what it keeps".into()));
+            }
         }
         Ok((cfg, cams))
     }
@@ -379,7 +510,45 @@ impl Config {
             hold: t.hold.unwrap_or(d.hold),
             start: t.start.unwrap_or(d.start),
             high: t.high.unwrap_or(d.high),
+            regions: self.motion.as_ref().filter(|m| m.regions).map(|m| crate::regions::Regions {
+                size: self.detector.size,
+                most: m.most_regions.unwrap_or(2),
+                ..Default::default()
+            }),
         }
+    }
+
+    fn motion_options_of(&self, m: &MotionSection) -> crate::motion::MotionOptions {
+        let d = crate::motion::MotionOptions::default();
+        crate::motion::MotionOptions {
+            height: m.height.unwrap_or(d.height),
+            threshold: m.threshold.unwrap_or(d.threshold),
+            min_area: m.min_area.unwrap_or(d.min_area),
+            alpha: m.alpha.unwrap_or(d.alpha),
+            lighting: m.lighting.unwrap_or(d.lighting),
+            mask: Vec::new(), // each camera's own, from its `motion_mask`
+        }
+    }
+
+    /// How motion is found, if `[motion]` is on.
+    pub fn motion_options(&self) -> Option<crate::motion::MotionOptions> {
+        self.motion.as_ref().map(|m| self.motion_options_of(m))
+    }
+
+    /// How long recordings are kept, if `[record]` is on.
+    pub fn retention(&self) -> Option<crate::retention::Policy> {
+        let r = self.record.as_ref()?;
+        let ms = |days: f64| (days * 86_400_000.0) as u64;
+        let all = ms(r.all_days);
+        let motion = r.motion_days.map(ms).unwrap_or(all).max(all);
+        let objects = r.objects_days.map(ms).unwrap_or(motion).max(all);
+        Some(crate::retention::Policy {
+            all, motion, objects,
+            labels: r.labels.iter().map(|(k, &v)| (k.clone(), ms(v))).collect(),
+            pre: (r.pre_seconds * 1000.0) as u64,
+            post: (r.post_seconds * 1000.0) as u64,
+            max_bytes: r.max_gb.map(|g| (g * 1e9) as u64),
+        })
     }
 
     /// The bearer token the HTTP endpoints require, if any.
@@ -505,6 +674,38 @@ mod tests {
             if cfg!(feature = "onvif") || !body.contains("onvif=") {
                 assert!(e.contains(says), "{body}: {e}");
             }
+        }
+    }
+
+    #[test]
+    fn recording_and_motion_settings() {
+        let d = dir();
+        let body = "[motion]\nhold = 5\nregions = true\n[record]\ndir = \"rec\"\nall_days = 1\nmotion_days = 3\nobjects_days = 14\nlabels = { person = 30 }\nmax_gb = 2\n\
+                    [[camera]]\nname=\"gate\"\nurl=\"rtsp://h/1\"\nrecord=true\nlive=true\nmotion_mask=[[0.8, 0.0, 1.0, 0.1]]\n[[camera]]\nname=\"yard\"\nurl=\"rtsp://h/2\"\n";
+        let (cfg, cams) = Config::load(write(&d, "c.toml", &format!("{HEAD}{body}"), 0o600)).unwrap();
+        assert!(cams[0].record && cams[0].live && !cams[1].record && !cams[1].live);
+        assert_eq!(cfg.record.as_ref().unwrap().dir, d.join("rec"));
+        let p = cfg.retention().unwrap();
+        assert_eq!((p.all, p.motion, p.objects, p.label("person"), p.label("car")),
+                   (86_400_000, 3 * 86_400_000, 14 * 86_400_000, 30 * 86_400_000, 14 * 86_400_000));
+        assert_eq!(p.max_bytes, Some(2_000_000_000));
+        assert_eq!(cfg.motion.as_ref().unwrap().hold, 5);
+        assert!(cfg.motion_options().is_some());
+        assert_eq!(cams[0].motion_mask, vec![[0.8, 0.0, 1.0, 0.1]]);
+        assert_eq!(cfg.tracker_options(&cams).regions.map(|r| r.size), Some(416), "regions at the model's size");
+    }
+
+    #[test]
+    fn recording_mistakes_are_caught() {
+        let d = dir();
+        for body in ["[[camera]]\nname=\"a\"\nurl=\"rtsp://h/1\"\nrecord=true\n",
+                     "[[camera]]\nname=\"../a\"\nurl=\"rtsp://h/1\"\nlive=true\n",
+                     "[record]\ndir=\"r\"\nmotion_days=3\n",
+                     "[record]\ndir=\"r\"\nsegment_seconds=0\n",
+                     "[motion]\nalpha=0\n",
+                     "[[camera]]\nname=\"a\"\nurl=\"rtsp://h/1\"\nmotion_mask=[[0.5, 0.0, 0.2, 1.0]]\n"] {
+            let cfg = write(&d, "c.toml", &format!("{HEAD}{body}"), 0o600);
+            assert!(Config::load(&cfg).is_err(), "{body}");
         }
     }
 
