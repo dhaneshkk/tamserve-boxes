@@ -73,7 +73,7 @@ fn pmt_pid(p: &[u8]) -> Option<u16> {
 
 impl Start {
     fn see(&mut self, chunk: &[u8]) {
-        for p in chunk.chunks_exact(PACKET) {
+        for p in chunk.as_chunks::<PACKET>().0 {
             if p[0] != 0x47 {
                 continue;
             }

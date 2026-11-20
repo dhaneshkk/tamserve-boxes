@@ -13,7 +13,9 @@ pub fn rgb_to_gray(rgb: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
         return Err(Error::Invalid(format!("{} bytes is not a {width} x {height} RGB frame", rgb.len())));
     }
     Ok(rgb
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|p| (p[0] as f32 * 0.299 + p[1] as f32 * 0.587 + p[2] as f32 * 0.114 + 0.5) as u8)
         .collect())
 }
