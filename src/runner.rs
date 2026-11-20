@@ -118,7 +118,7 @@ impl Runner {
     /// Record cameras with `record = true` to `dir` in `segment`-long pieces, and sweep
     /// `dir` by `policy` every `every`. Call before [`set_cameras`](Runner::set_cameras).
     pub fn with_recording(mut self, dir: PathBuf, segment: Duration, policy: Policy, every: Duration) -> Result<Runner> {
-        std::fs::create_dir_all(&dir)?;
+        crate::retention::private_dir(&dir)?;
         self.opening.record = Some(crate::camera::RecordTo { dir: dir.clone(), segment });
         self.record = Some(dir.clone());
         self.shared.recordings.lock().unwrap().on = true;

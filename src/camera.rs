@@ -489,7 +489,7 @@ fn shared_pipeline(camera: &Camera, target: &str, how: &Opening, caps: &str, syn
             tee.link(&decoded).map_err(|e| e.to_string())?;
             if let Some(rec) = &record {
                 let dir = rec.dir.join(&name);
-                std::fs::DirBuilder::new().recursive(true).create(&dir).map_err(|e| format!("cannot record to {}: {e}", dir.display()))?;
+                crate::retention::private_dir(&dir).map_err(|e| format!("cannot record to {}: {e}", dir.display()))?;
                 let split = gst::ElementFactory::make("splitmuxsink")
                     .property("max-size-time", rec.segment.as_nanos() as u64)
                     .property("muxer-factory", "mpegtsmux")

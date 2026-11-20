@@ -262,6 +262,16 @@ pub fn scan(root: &Path) -> Result<BTreeMap<String, Vec<Segment>>> {
     Ok(out)
 }
 
+/// Make a folder for recordings that only its owner and group can open (mode 750 on
+/// Unix): they are pictures of people.
+pub fn private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o750);
+    b.create(dir)
+}
+
 pub fn read_pins(root: &Path) -> Result<Vec<Pin>> {
     match std::fs::read_to_string(root.join("pins.json")) {
         Ok(t) => serde_json::from_str(&t).map_err(|e| Error::Invalid(format!("{}: {e}", root.join("pins.json").display()))),
