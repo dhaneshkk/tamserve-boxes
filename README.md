@@ -209,6 +209,40 @@ What was learned building it, on a 2-core CPU with demo data:
 | 8 × 25 | Rust, 8 processes | 1.02 | 880 MB | 23.6 |
 | 8 × 25 | Python, 8 processes | 1.05 | 1,544 MB | 21.9 |
 
+### Compressed swap (zram) on Ubuntu
+
+zram gives a box more room to spare, but it doesn't make room for more cameras. Detection memory is almost all in use every frame: weights of a few MB, per-frame buffers that are reused, and ring buffers of decoded frames. Pages in use don't get swapped, and the incoming H.264 barely compresses anyway. What zram does compress is the box's idle memory: other services, logs, the parts of a database not being queried. That's headroom against running out of memory. It costs CPU on the cores detection uses, so it's set up to cost little:
+
+```bash
+sudo deploy/setup-zram.sh                     # lz4 at 25% of RAM, swappiness 100, page-cluster 0, zswap off
+sudo deploy/setup-zram.sh --remove-swapfile   # and remove Ubuntu's /swap.img (recommended on SD or eMMC)
+deploy/setup-zram.sh --check                  # report: swap devices, zramctl, zswap, sysctls, memory pressure
+```
+
+It uses `systemd-zram-generator` where Ubuntu packages it, and `zram-tools` otherwise. It loads the zram module from `linux-modules-extra` if the kernel needs that. The files it installs are in [`deploy/zram/`](deploy/zram/), so you can install them by hand instead.
+
+- **lz4, not zstd**: zstd compresses better but takes several times the CPU per page.
+- **swappiness 100, not the desktop 180**: a page fault that has to decompress stalls the thread that hit it, so swap only what's really idle.
+- **zswap off**: in front of zram it would compress the same pages twice.
+- **The detector never swaps.** [`deploy/systemd/tamserve-boxes.service`](deploy/systemd/tamserve-boxes.service) sets `MemorySwapMax=0` (cgroup v2, the default since Ubuntu 21.10), so inference and decode threads never wait on decompression. It also sets `OOMScoreAdjust=-500`, so if memory runs out the kernel kills something else first. `CPUAffinity=` (commented out) can leave core 0 to the kernel's reclaim; lower `[detector] threads` to match.
+
+```bash
+sudo useradd --system --no-create-home tamserve
+sudo install -m 755 target/release/tamserve-boxes /usr/local/bin/
+sudo install -m 644 deploy/systemd/tamserve-boxes.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now tamserve-boxes
+```
+
+`/etc/tamserve/env` (mode 600, optional) holds `LD_LIBRARY_PATH` for OpenVINO and any `password_env` variables. `cameras.toml` and the password files must belong to the `tamserve` user, because they must be mode 600.
+
+To check zram is working, run your normal cameras plus some extra memory pressure, with zram on and with it off, and compare:
+- p99 step time (`tamserve_step_seconds_last`) and frame age;
+- `/proc/pressure/memory`, which should stay near 0;
+- `vmstat 1` `si`/`so`, which should not rise and fall with slow steps;
+- the TOTAL column in `zramctl`, which is the RAM really used.
+
+`--check` also shows the detector's `memory.swap.max`, which should be 0.
+
 ## Tests
 
 ```bash
@@ -247,6 +281,7 @@ scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs m
 - VA-API decoding in the shared pipeline (as with VA-API at all: no Intel GPU here).
 - Recording many cameras' main streams to one disk at once, and the sweeper on a disk with months of segments.
 - Live view in a browser: mpegts.js is expected to play `/live/<camera>.ts`, but that hasn't been tried.
+- `deploy/setup-zram.sh` on real Ubuntu. It passes shellcheck, but the machine this was built on has no zram module. Run `--check` before and after on the target box.
 
 ## Licences
 

@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Deployment scripts
+        run: shellcheck deploy/setup-zram.sh
       - name: GStreamer
         run: |
           sudo apt-get update -qq
