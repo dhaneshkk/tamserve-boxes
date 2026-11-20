@@ -195,7 +195,7 @@ impl ActivityLog {
 
     /// Write the open interval, if any, and that the log covers up to `t`.
     pub fn flush(&mut self, t: u64) -> Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
+        private_dir(&self.dir)?;
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join(format!("{}.jsonl", t / DAY_MS)))?;
         let mut text = String::new();
         if let Some(a) = self.open.take() {

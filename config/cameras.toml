@@ -26,6 +26,7 @@ listen = "127.0.0.1:9300"        # /metrics (Prometheus), /status, /v1/chat/comp
 
 [motion]                         # look only where something moves (and keep motion in recordings)
 hold = 10                        # frames a camera stays awake after it last moved
+# regions = true                 # crop looks around motion and what is followed: for main streams
 
 [record]
 dir = "/var/lib/tamserve/recordings"
@@ -45,6 +46,7 @@ password_file = "/etc/tamserve/secrets/gate"
 look_every = 1                   # this camera's own
 record = true                    # to [record] dir, from this box's one connection
 live = true                      # GET /live/gate.ts on [http]
+motion_mask = [[0.75, 0.0, 1.0, 0.08]]   # the clock overlay: no motion there
 
 [[camera]]
 name = "yard"

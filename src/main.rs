@@ -160,6 +160,38 @@ fn detect(a: &Args) -> Res<()> {
     Ok(())
 }
 
+/// Set by SIGINT or SIGTERM: the loop closes its cameras, and their recordings, and ends.
+#[cfg(feature = "cameras")]
+static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(feature = "cameras", unix))]
+extern "C" fn on_stop_signal(_: libc::c_int) {
+    STOPPING.store(true, std::sync::atomic::Ordering::Relaxed); // an atomic store: safe in a signal handler
+}
+
+/// Watch for SIGINT and SIGTERM.
+#[cfg(all(feature = "cameras", unix))]
+fn watch_signals() -> Res<()> {
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        // SAFETY: the handler only stores to an atomic.
+        let old = unsafe { libc::signal(sig, on_stop_signal as *const () as libc::sighandler_t) };
+        if old == libc::SIG_ERR {
+            return Err(format!("cannot watch signal {sig}").into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "cameras", not(unix)))]
+fn watch_signals() -> Res<()> {
+    Ok(())
+}
+
+#[cfg(feature = "cameras")]
+fn stopping() -> bool {
+    STOPPING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `[motion]` and `[record]`, if the config has them.
 #[cfg(feature = "cameras")]
 fn with_extras(mut runner: tamserve_boxes::runner::Runner, cfg: &tamserve_boxes::config::Config) -> Res<tamserve_boxes::runner::Runner> {
@@ -205,6 +237,7 @@ fn run(a: &Args) -> Res<()> {
         return Err("the config has no [[camera]]".into());
     }
     camera::init(cfg.decode.decoder)?;
+    watch_signals()?;
     let tracker = BoxTracker::from_model(&cfg.detector.model, cfg.detector_options(), cfg.tracker_options(&cams))?;
     let mut runner = with_extras(Runner::new(tracker, camera::Opening::from(&cfg.decode)), &cfg)?;
     runner.set_cameras(&cams)?;
@@ -216,6 +249,11 @@ fn run(a: &Args) -> Res<()> {
     let mut states = HashMap::new();
     let stdout = std::io::stdout();
     loop {
+        if stopping() {
+            eprintln!("tamserve-boxes: stopping: closing the cameras and their recordings");
+            runner.close();
+            return Ok(());
+        }
         let reports = runner.step(Duration::from_millis(500))?;
         log_changes(&runner.shared, &mut states);
         let mut out = stdout.lock();
@@ -366,6 +404,7 @@ fn run_box(a: &Args) -> Res<()> {
     let name = a.get("name").ok_or("--name is needed: what the coordinator calls this box")?.to_string();
     let capacity: f64 = a.num("capacity", cams.iter().map(|c| c.weight).sum::<f64>())?;
     camera::init(cfg.decode.decoder)?;
+    watch_signals()?;
     let tracker = BoxTracker::from_model(&cfg.detector.model, cfg.detector_options(), cfg.tracker_options(&cams))?;
     let mut runner = with_extras(Runner::new(tracker, camera::Opening::from(&cfg.decode)), &cfg)?;
     let shared = runner.shared.clone();
@@ -453,6 +492,11 @@ fn run_box(a: &Args) -> Res<()> {
 
     let mut states = HashMap::new();
     loop {
+        if stopping() {
+            eprintln!("tamserve-boxes box {name}: stopping: closing the cameras and their recordings");
+            runner.close();
+            return Ok(());
+        }
         let mut wanted = None;
         while let Ok(w) = assign_rx.try_recv() {
             wanted = Some(w); // only the newest assignment matters

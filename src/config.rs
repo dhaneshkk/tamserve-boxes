@@ -31,6 +31,7 @@
 //!
 //! [motion]             # look only where something moves (see `motion`)
 //! hold = 10            # frames a camera stays awake after motion
+//! regions = true       # crop looks around motion (see `regions`)
 //!
 //! [record]             # see `retention`
 //! dir = "/var/lib/tamserve/recordings"
@@ -135,6 +136,10 @@ pub struct CameraSection {
     /// Serve this camera's stream on `GET /live/<name>.ts`.
     #[serde(default)]
     pub live: bool,
+    /// Parts of this camera's picture where motion is not looked for:
+    /// [[left, top, right, bottom], ...] as shares of its width and height (0 to 1).
+    #[serde(default)]
+    pub motion_mask: Vec<[f32; 4]>,
 }
 
 /// Motion found before detecting, so that cameras where nothing moves cost no looks.
@@ -152,6 +157,12 @@ pub struct MotionSection {
     pub min_area: Option<usize>,
     pub alpha: Option<f32>,
     pub lighting: Option<f32>,
+    /// Crop looks to squares around what moved and what is followed: for main streams,
+    /// where small things are lost in the whole frame.
+    #[serde(default)]
+    pub regions: bool,
+    /// The most squares in one camera's look (default 2).
+    pub most_regions: Option<usize>,
 }
 
 /// Recording, and how long recordings are kept.
@@ -237,6 +248,7 @@ pub struct Camera {
     pub weight: f64,
     pub record: bool,
     pub live: bool,
+    pub motion_mask: Vec<[f32; 4]>,
 }
 
 impl std::fmt::Debug for Camera {
@@ -349,7 +361,10 @@ impl Config {
                     "camera {:?}: a camera that records or is watched live names a folder and a URL: use letters, digits, `-`, `_` and `.` only", c.name)));
             }
             cams.push(Camera { name: c.name.clone(), url: c.url.clone(), user: c.user.clone(), password,
-                               look_every: c.look_every, weight: c.weight.unwrap_or(1.0), record, live: c.live });
+                               look_every: c.look_every, weight: c.weight.unwrap_or(1.0), record, live: c.live,
+                               motion_mask: c.motion_mask.clone() });
+            crate::motion::MotionOptions { mask: c.motion_mask.clone(), ..Default::default() }.check()
+                .map_err(|e| Error::Invalid(format!("camera {:?}: {e}", c.name)))?;
         }
         if inline {
             owner_only(path)?;
@@ -400,6 +415,11 @@ impl Config {
             hold: t.hold.unwrap_or(d.hold),
             start: t.start.unwrap_or(d.start),
             high: t.high.unwrap_or(d.high),
+            regions: self.motion.as_ref().filter(|m| m.regions).map(|m| crate::regions::Regions {
+                size: self.detector.size,
+                most: m.most_regions.unwrap_or(2),
+                ..Default::default()
+            }),
         }
     }
 
@@ -411,6 +431,7 @@ impl Config {
             min_area: m.min_area.unwrap_or(d.min_area),
             alpha: m.alpha.unwrap_or(d.alpha),
             lighting: m.lighting.unwrap_or(d.lighting),
+            mask: Vec::new(), // each camera's own, from its `motion_mask`
         }
     }
 
@@ -518,8 +539,8 @@ mod tests {
     #[test]
     fn recording_and_motion_settings() {
         let d = dir();
-        let body = "[motion]\nhold = 5\n[record]\ndir = \"rec\"\nall_days = 1\nmotion_days = 3\nobjects_days = 14\nlabels = { person = 30 }\nmax_gb = 2\n\
-                    [[camera]]\nname=\"gate\"\nurl=\"rtsp://h/1\"\nrecord=true\nlive=true\n[[camera]]\nname=\"yard\"\nurl=\"rtsp://h/2\"\n";
+        let body = "[motion]\nhold = 5\nregions = true\n[record]\ndir = \"rec\"\nall_days = 1\nmotion_days = 3\nobjects_days = 14\nlabels = { person = 30 }\nmax_gb = 2\n\
+                    [[camera]]\nname=\"gate\"\nurl=\"rtsp://h/1\"\nrecord=true\nlive=true\nmotion_mask=[[0.8, 0.0, 1.0, 0.1]]\n[[camera]]\nname=\"yard\"\nurl=\"rtsp://h/2\"\n";
         let (cfg, cams) = Config::load(write(&d, "c.toml", &format!("{HEAD}{body}"), 0o600)).unwrap();
         assert!(cams[0].record && cams[0].live && !cams[1].record && !cams[1].live);
         assert_eq!(cfg.record.as_ref().unwrap().dir, d.join("rec"));
@@ -529,6 +550,8 @@ mod tests {
         assert_eq!(p.max_bytes, Some(2_000_000_000));
         assert_eq!(cfg.motion.as_ref().unwrap().hold, 5);
         assert!(cfg.motion_options().is_some());
+        assert_eq!(cams[0].motion_mask, vec![[0.8, 0.0, 1.0, 0.1]]);
+        assert_eq!(cfg.tracker_options(&cams).regions.map(|r| r.size), Some(416), "regions at the model's size");
     }
 
     #[test]
@@ -538,7 +561,8 @@ mod tests {
                      "[[camera]]\nname=\"../a\"\nurl=\"rtsp://h/1\"\nlive=true\n",
                      "[record]\ndir=\"r\"\nmotion_days=3\n",
                      "[record]\ndir=\"r\"\nsegment_seconds=0\n",
-                     "[motion]\nalpha=0\n"] {
+                     "[motion]\nalpha=0\n",
+                     "[[camera]]\nname=\"a\"\nurl=\"rtsp://h/1\"\nmotion_mask=[[0.5, 0.0, 0.2, 1.0]]\n"] {
             let cfg = write(&d, "c.toml", &format!("{HEAD}{body}"), 0o600);
             assert!(Config::load(&cfg).is_err(), "{body}");
         }

@@ -288,6 +288,11 @@ impl Source {
         Ok(Source { camera, health, live, newest, stop, thread: Some(thread) })
     }
 
+    /// Tell its thread to stop, without waiting for it (dropping the source waits).
+    pub fn stop_soon(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
     /// The newest frame not yet taken, if any.
     pub fn take(&self) -> Option<Frame> {
         self.newest.lock().unwrap().take()
@@ -494,6 +499,10 @@ fn shared_pipeline(camera: &Camera, target: &str, how: &Opening, caps: &str, syn
                     .property("max-size-time", rec.segment.as_nanos() as u64)
                     .property("muxer-factory", "mpegtsmux")
                     .property("async-finalize", false)
+                    // Whole 7-packet writes through a 16 KB buffer: a crash loses at most that
+                    // much of the open segment (what the kernel has not written yet aside).
+                    .property("muxer-properties", gst::Structure::builder("properties").field("alignment", 7i32).build())
+                    .property("sink-properties", gst::Structure::builder("properties").field("buffer-size", 16_384u32).build())
                     .build().map_err(|_| "GStreamer has no splitmuxsink (gstreamer1.0-plugins-good)".to_string())?;
                 let h2 = h.clone();
                 // Each segment is named by when it starts, in ms since 1970.
@@ -560,7 +569,8 @@ fn stream(camera: &Camera, target: &str, how: &Opening, health: &Arc<Health>, ne
         caps += &format!(",width={w},height={h}");
     }
     let sync = how.realtime || !is_live(target);
-    let built = if (camera.record && how.record.is_some()) || live.is_some() {
+    let shared = (camera.record && how.record.is_some()) || live.is_some();
+    let built = if shared {
         shared_pipeline(camera, target, how, &caps, sync, health, live)
     } else {
         simple_pipeline(camera, target, how, &caps, sync)
@@ -635,6 +645,18 @@ fn stream(camera: &Camera, target: &str, how: &Opening, health: &Arc<Health>, ne
             break Outcome::Failed(format!("no frame for {:.0} s", quiet.as_secs_f64()));
         }
     };
+    if shared && matches!(outcome, Outcome::Stopped) {
+        finish(&pipeline, &bus);
+    }
     let _ = pipeline.set_state(gst::State::Null);
     outcome
+}
+
+/// End a shared pipeline cleanly when it is stopped: an end of stream down every branch,
+/// so the recorder closes its open segment whole. Waits at most 3 s for it.
+fn finish(pipeline: &gst::Pipeline, bus: &gst::Bus) {
+    if !pipeline.send_event(gst::event::Eos::new()) {
+        return;
+    }
+    let _ = bus.timed_pop_filtered(gst::ClockTime::from_seconds(3), &[gst::MessageType::Eos, gst::MessageType::Error]);
 }

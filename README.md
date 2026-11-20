@@ -102,6 +102,8 @@ Three things taken from [Frigate](https://github.com/blakeblackshear/frigate), d
 [motion]                 # look only where something moves
 hold = 10                # frames a camera stays awake after it last moved
 # gate = false           # find motion (for metrics and recording) but make every look
+# regions = true         # crop looks to squares around motion and what is followed (main streams)
+# most_regions = 2
 
 [record]
 dir = "/var/lib/tamserve/recordings"
@@ -119,9 +121,14 @@ name = "gate"
 url = "rtsp://10.0.0.21/Streaming/Channels/101"
 record = true            # or [record] all_cameras = true
 live = true              # GET /live/gate.ts
+motion_mask = [[0.8, 0.0, 1.0, 0.1]]   # [left, top, right, bottom] shares: the clock overlay
 ```
 
 **The motion gate.** Each frame's gray plane is shrunk to 100 rows by area averaging and compared with a running average of the frames before it. Changed pixels are grouped into regions, and specks are dropped. When most of the picture changes at once, it's taken as the light, not motion: the IR cut filter switching at dusk, floodlights, lightning. The average then starts over from the new frame. A camera that hasn't moved for `hold` frames, and follows nothing (not even an object held after it was last seen), is left out of the look. It looks again on the first frame that moves, and a person standing still is still followed, because a camera that follows something is always looked at. With `[motion]` absent, nothing changes: `step_gated` with no quiet cameras is `step`, tested look for look.
+
+`motion_mask` leaves parts of a camera's picture out of motion: a clock overlay, trees, a road beyond the fence. The parts are given as shares of the width and height, so the same mask fits the sub-stream and the main stream. Masked pixels don't count towards the light-change share either. Masks only stop motion from waking the gate: an object in a masked part is still found and followed when the camera looks.
+
+**Regions** (`regions = true`). On a 1920 x 1080 main stream, the whole frame goes into YOLOX-Nano's 416 x 416 at under a quarter of its size, so small things vanish. With regions, a look is cropped instead to squares of at least the model's size around what moved and what is followed. Overlapping squares are joined, and each square goes in at full size. The squares are views into the frame, not copies. A find cut by a square's edge inside the frame is left out, and that camera's next look is whole. A camera's first look is always whole, and so is a look with nothing to centre on, more than `most_regions` squares, or squares covering more than half the frame. Each square is a look of its own, so this is for finding small things on big frames, not for saving looks. On a 640 x 360 sub-stream no 416 square fits, and every look stays whole. Tested with YOLOX-Nano: the dog at a third of its size on a 1080p frame is not found by a whole-frame look, but is found and followed, in the right place, through a region. [`proofs/Regions.lean`](proofs/Regions.lean) proves that a square, and every find moved out of it, stays inside the frame.
 
 Measure the gate on your own footage before relying on it:
 
@@ -132,9 +139,9 @@ cargo run --release --example gate_mcc -- yolox_nano_gray.onnx night_clip.mp4 10
 
 It runs the detector on every frame as the truth, and counts how often the gate would have slept through a frame with something on it (`fn`). Tune `hold` and `threshold` on night and day footage from each site until recall is where it must be. Then read MCC and the share of looks saved. `alpha` is per frame used: something bright that stood still and then left lingers in the average, so the gate stays awake longer. It errs towards looking, never towards missing.
 
-**One connection.** A camera with `record` or `live` is opened as `urisourcebin ! parsebin ! h264parse|h265parse ! tee`. The tee feeds the decoder (gray frames for detection, as before), a `splitmuxsink` writing MPEG-TS segments, and an `mpegtsmux` publishing to live viewers. The camera serves one client however many use it. Its stream is decoded once and never encoded. Parameter sets go before every keyframe, so each segment decodes on its own and a viewer who joins mid-stream starts at the next keyframe. A camera that only follows keeps the old `uridecodebin` pipeline. Recording and live view need H.264 or H.265; an MJPEG camera is still followed, with the reason in its `last_error`.
+**One connection.** A camera with `record` or `live` is opened as `urisourcebin ! parsebin ! h264parse|h265parse ! tee`. The tee feeds the decoder (gray frames for detection, as before), a `splitmuxsink` writing MPEG-TS segments, and an `mpegtsmux` publishing to live viewers. The camera serves one client however many use it. Its stream is decoded once and never encoded. Parameter sets go before every keyframe, so each segment decodes on its own. The live tap keeps the latest PAT, the latest PMT, and every packet since the latest keyframe (the one `mpegtsmux` marks random-access, up to 8 MB). A viewer who joins mid-stream is sent those first, so their player shows a picture at once. A camera that only follows keeps the old `uridecodebin` pipeline. Recording and live view need H.264 or H.265; an MJPEG camera is still followed, with the reason in its `last_error`.
 
-**Retention.** Segments are `DIR/<camera>/<start ms>.ts`. MPEG-TS, not MP4, so a segment cut short by a power cut still plays up to its last flushed write. Each step, what a recording camera showed (motion, labels) goes to `DIR/<camera>/activity/<day>.jsonl`, with how far the log covers. A segment's keep-until is its end plus the longest retention of any activity within `pre_seconds` before it to `post_seconds` after it. A segment past the end of the log (the box stopped before writing what it showed) is kept the longest, since what it holds is unknown. A sweep every `sweep_seconds`:
+**Retention.** Segments are `DIR/<camera>/<start ms>.ts`. MPEG-TS, not MP4, so a segment cut short by a power cut still plays up to its last flushed write. The recorder writes through a 16 KB buffer, so a crash loses at most that much of the open segment, plus whatever the kernel hadn't written to disk yet. On SIGINT or SIGTERM, `run` and `box` stop every camera at once and send an end of stream down each pipeline, so each open segment is closed whole (waiting at most 3 s); they also write the activity logs. Each step, what a recording camera showed (motion, labels) goes to `DIR/<camera>/activity/<day>.jsonl`, with how far the log covers. A segment's keep-until is its end plus the longest retention of any activity within `pre_seconds` before it to `post_seconds` after it. A segment past the end of the log (the box stopped before writing what it showed) is kept the longest, since what it holds is unknown. A sweep every `sweep_seconds`:
 
 1. deletes every segment whose keep-until has passed;
 2. while the recordings take more than `max_gb`, deletes the segments that would expire first, so a motion-only segment goes before one with a person.
@@ -152,7 +159,7 @@ tamserve-boxes sweep --config cameras.toml --dry-run   # what would go now, as J
 - the space rule frees only what expires no later than everything it keeps.
 
 ```bash
-lean proofs/Retention.lean
+lean proofs/Retention.lean && lean proofs/Regions.lean
 ```
 
 [`notebooks/motion_record_live.ipynb`](notebooks/motion_record_live.ipynb) is one Colab cell that does all of this on a test clip. It measures the gate against the detector (MCC), runs a box that records and streams, reads it back through `/v1/chat/completions`, sweeps the recordings, and checks the proof. Set `TSB_BRANCH` to try a branch.
@@ -205,7 +212,7 @@ What was learned building it, on a 2-core CPU with demo data:
 ## Tests
 
 ```bash
-cargo test --release                                   # 52 tests; the 5 that need the model run when these are set:
+cargo test --release                                   # 64 tests; the 6 that need the model run when these are set:
 TAMSERVE_YOLOX_ONNX=yolox_nano.onnx TAMSERVE_DOG_JPG=dog.jpg cargo test --release
 scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs mediamtx and ffmpeg
 ```
@@ -215,10 +222,11 @@ scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs m
   - the coordinator over loopback: wrong token, a stalled handshake cut off, changed and replayed messages refused, spreading by capacity, failover, cameras a box doesn't know, a box reconnecting;
   - the tracker tests ported from Python;
   - the model tests, including that splitting a look across requests changes nothing;
-  - motion: still pictures, a moving square found where it is, specks, the light changing, the gate holding open;
+  - motion: still pictures, a moving square found where it is, specks, the light changing, masks, the gate holding open;
+  - regions: squares around small things, inside the frame, joined when they overlap, the whole frame when they wouldn't help, finds moved back and cut ones left out, duplicates; in the tracker, cropped looks landing where the whole-frame ones do; with the model, the small dog found only through a region;
   - the gate in the tracker: never quiet changes nothing, quiet cameras cost no looks, what is followed is still followed;
   - retention: each kind of segment's days, the seconds before and after an event, segments past the log, the space order, pins, a sweep on disk, a bad pins file;
-  - live fan-out: every viewer in order, a slow viewer dropped, the limits;
+  - live fan-out: every viewer in order, a slow viewer dropped, the limits, a late viewer starting at the latest keyframe with the tables;
   - `tests/recording.rs`: one clip followed with the gate, recorded and watched at once (needs `x264enc` to make the clip).
 - **`scripts/rtsp_test.sh`**, against a real RTSP server that needs a password (all 10 checks pass):
   - four cameras up;
@@ -227,7 +235,7 @@ scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs m
   - Prometheus and OpenAI-compatible endpoints;
   - cameras down with the server and back by themselves;
   - a coordinator with two boxes, one killed with SIGKILL, its cameras moved in 1.4 s;
-  - one camera recorded and watched live over RTSP with its password: segments decode on their own, and a camera without `live` has no stream.
+  - one camera recorded and watched live over RTSP with its password: segments decode on their own, a viewer joining mid-stream decodes from its first picture, a camera without `live` has no stream, and SIGTERM closes the open segment whole.
 
 ## Not yet tested
 
@@ -235,7 +243,8 @@ scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs m
 - Live cameras other than the local RTSP server above.
 - More than 4 cameras through GStreamer at once.
 - A long soak. Run `bench` and `rtsp_test.sh` on the target box first, then a day-long run with `/metrics` scraped.
-- The motion gate on real night and day footage: tune it with `gate_mcc` per site before using it for safety monitoring.
+- The motion gate, masks and regions on real night and day footage: tune them with `gate_mcc` per site before using them for safety monitoring.
+- VA-API decoding in the shared pipeline (as with VA-API at all: no Intel GPU here).
 - Recording many cameras' main streams to one disk at once, and the sweeper on a disk with months of segments.
 - Live view in a browser: mpegts.js is expected to play `/live/<camera>.ts`, but that hasn't been tried.
 

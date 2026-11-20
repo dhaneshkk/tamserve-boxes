@@ -57,7 +57,7 @@ fn one_connection_is_followed_recorded_and_watched() {
         .with_motion(MotionOptions { alpha: 0.1, ..Default::default() }, true, 5).unwrap()
         .with_recording(rec.clone(), Duration::from_secs(2), policy, Duration::from_secs(3600)).unwrap();
     let cam = Camera { name: "gate".into(), url: video.display().to_string(), user: None, password: None,
-                       look_every: None, weight: 1.0, record: true, live: true };
+                       look_every: None, weight: 1.0, record: true, live: true, motion_mask: Vec::new() };
     runner.set_cameras(&[cam]).unwrap();
     let (health, tap) = {
         let views = runner.shared.cameras.lock().unwrap();
@@ -65,8 +65,13 @@ fn one_connection_is_followed_recorded_and_watched() {
     };
     let viewer = tap.subscribe().unwrap();
     let until = Instant::now() + Duration::from_secs(60);
+    let (mut steps, mut late) = (0, None);
     while !runner.all_ended() && Instant::now() < until {
         runner.step(Duration::from_millis(200)).unwrap();
+        steps += 1;
+        if steps == 60 {
+            late = tap.subscribe(); // 2.4 s in: mid-picture-group
+        }
     }
     assert!(runner.all_ended(), "the clip was not read to its end: {}", health.last_error());
     drop(runner); // stops the camera: its last segment is closed
@@ -84,6 +89,13 @@ fn one_connection_is_followed_recorded_and_watched() {
     let (activity, covered) = retention::read_activity(&rec, "gate");
     assert!(activity.iter().any(|a| a.motion), "{activity:?}");
     assert!(covered > 0);
+
+    // A late viewer starts with the tables and then a keyframe, not mid-picture-group.
+    let first = late.expect("a second viewer").try_recv().expect("its start");
+    let pid = |p: &[u8]| (((p[1] & 0x1f) as u16) << 8) | p[2] as u16;
+    assert_eq!(pid(&first[..188]), 0, "the PAT first");
+    let key = &first[376..564];
+    assert!((key[3] >> 4) & 2 != 0 && key[5] & 0x40 != 0, "then a packet marked random-access: a keyframe");
 
     let live: Vec<u8> = viewer.try_iter().flat_map(|c| c.to_vec()).collect();
     assert!(live.len() > 10_000 && live[0] == 0x47 && live.len().is_multiple_of(188), "{} live bytes", live.len());

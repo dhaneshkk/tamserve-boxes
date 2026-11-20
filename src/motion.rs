@@ -32,11 +32,14 @@ pub struct MotionOptions {
     pub alpha: f32,
     /// The share of the picture (0 to 1) beyond which a change is the light, not motion.
     pub lighting: f32,
+    /// Parts of the picture where motion is not looked for (a clock, trees, a road
+    /// beyond the fence), as [left, top, right, bottom] shares of its width and height.
+    pub mask: Vec<[f32; 4]>,
 }
 
 impl Default for MotionOptions {
     fn default() -> Self {
-        MotionOptions { height: 100, threshold: 30, min_area: 10, alpha: 0.01, lighting: 0.8 }
+        MotionOptions { height: 100, threshold: 30, min_area: 10, alpha: 0.01, lighting: 0.8, mask: Vec::new() }
     }
 }
 
@@ -48,6 +51,8 @@ impl MotionOptions {
             "motion.alpha must be above 0 and at most 1"
         } else if !(self.lighting > 0.0 && self.lighting <= 1.0) {
             "motion.lighting must be above 0 and at most 1"
+        } else if self.mask.iter().any(|m| !(m.iter().all(|v| (0.0..=1.0).contains(v)) && m[0] < m[2] && m[1] < m[3])) {
+            "a motion mask is [left, top, right, bottom], each from 0 to 1, left < right and top < bottom"
         } else {
             return Ok(());
         };
@@ -80,6 +85,9 @@ pub struct MotionDetector {
     small: (usize, usize),
     frame: (usize, usize),
     pixels: Vec<u8>,
+    /// The small pixels the mask leaves out, and how many it leaves in.
+    masked: Vec<bool>,
+    open: usize,
     mask: Vec<bool>,
     grown: Vec<bool>,
     seen: Vec<bool>,
@@ -90,7 +98,7 @@ pub struct MotionDetector {
 
 impl MotionDetector {
     pub fn new(opts: MotionOptions) -> MotionDetector {
-        MotionDetector { opts, average: Vec::new(), small: (0, 0), frame: (0, 0), pixels: Vec::new(), mask: Vec::new(),
+        MotionDetector { opts, average: Vec::new(), small: (0, 0), frame: (0, 0), pixels: Vec::new(), masked: Vec::new(), open: 0, mask: Vec::new(),
                          grown: Vec::new(), seen: Vec::new(), stack: Vec::new(), lighting_resets: 0 }
     }
 
@@ -108,6 +116,12 @@ impl MotionDetector {
             self.small = (w, h);
             self.frame = (f.width, f.height);
             self.average.clear();
+            // A small pixel is masked if its centre is in a masked part.
+            self.masked = (0..w * h).map(|i| {
+                let (x, y) = (((i % w) as f32 + 0.5) / w as f32, ((i / w) as f32 + 0.5) / h as f32);
+                self.opts.mask.iter().any(|m| x >= m[0] && x < m[2] && y >= m[1] && y < m[3])
+            }).collect();
+            self.open = self.masked.iter().filter(|&&m| !m).count().max(1);
         }
         let (w, h) = self.small;
         shrink(f, w, h, &mut self.pixels);
@@ -117,8 +131,8 @@ impl MotionDetector {
         }
         let t = self.opts.threshold as f32;
         self.mask.clear();
-        self.mask.extend(self.pixels.iter().zip(&self.average).map(|(&p, &a)| (p as f32 - a).abs() > t));
-        let changed = self.mask.iter().filter(|&&m| m).count() as f32 / (w * h) as f32;
+        self.mask.extend(self.pixels.iter().zip(&self.average).zip(&self.masked).map(|((&p, &a), &out)| !out && (p as f32 - a).abs() > t));
+        let changed = self.mask.iter().filter(|&&m| m).count() as f32 / self.open as f32;
         if changed > self.opts.lighting {
             self.average.iter_mut().zip(&self.pixels).for_each(|(a, &p)| *a = p as f32);
             self.lighting_resets += 1;
@@ -302,6 +316,16 @@ mod tests {
         assert_eq!(d.lighting_resets, 1);
         // The average starts from the new light, so the frames after it are still.
         assert!(!run(&mut d, &frame(640, 360, 160, None), 640, 360).moved());
+    }
+
+    #[test]
+    fn motion_under_the_mask_is_not_motion() {
+        // The square's part of the picture is masked; the same square elsewhere still moves.
+        let mut d = MotionDetector::new(MotionOptions { mask: vec![[0.4, 0.25, 0.65, 0.6]], ..Default::default() });
+        run(&mut d, &frame(640, 360, 40, None), 640, 360);
+        assert!(!run(&mut d, &frame(640, 360, 40, Some((300, 120, 60, 220))), 640, 360).moved());
+        assert!(run(&mut d, &frame(640, 360, 40, Some((40, 40, 60, 220))), 640, 360).moved());
+        assert!(MotionOptions { mask: vec![[0.5, 0.0, 0.4, 1.0]], ..Default::default() }.check().is_err());
     }
 
     #[test]

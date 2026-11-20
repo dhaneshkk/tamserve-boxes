@@ -83,6 +83,7 @@ struct Motion {
     gate: bool,
     hold: u32,
     cameras: HashMap<String, Gate>,
+    masks: HashMap<String, Vec<[f32; 4]>>,
 }
 
 /// Serves cameras on this box.
@@ -111,7 +112,7 @@ impl Runner {
     /// `hold` frames and follows nothing is not looked at.
     pub fn with_motion(mut self, opts: MotionOptions, gate: bool, hold: u32) -> Result<Runner> {
         opts.check()?;
-        self.motion = Some(Motion { opts, gate, hold, cameras: HashMap::new() });
+        self.motion = Some(Motion { opts, gate, hold, cameras: HashMap::new(), masks: HashMap::new() });
         Ok(self)
     }
 
@@ -165,6 +166,7 @@ impl Runner {
             self.generation.remove(n);
             if let Some(m) = &mut self.motion {
                 m.cameras.remove(n);
+                m.masks.remove(n);
             }
             if let Some(mut log) = self.logs.remove(n) {
                 let _ = log.flush(now_ms());
@@ -179,6 +181,9 @@ impl Runner {
             let s = Source::open(c.clone(), &self.opening, self.bell.clone())?;
             self.shared.cameras.lock().unwrap().insert(c.name.clone(),
                 View { label: c.label(), health: s.health.clone(), latest: None, motion: Vec::new(), live: s.live.clone() });
+            if let Some(m) = &mut self.motion {
+                m.masks.insert(c.name.clone(), c.motion_mask.clone());
+            }
             if let (true, Some(dir)) = (c.record, &self.record) {
                 self.logs.insert(c.name.clone(), ActivityLog::new(dir, &c.name));
             }
@@ -186,6 +191,17 @@ impl Runner {
             opened.push(c.name.clone());
         }
         Ok((opened, gone))
+    }
+
+    /// Stop every camera at once, so that their recordings close their open segments in
+    /// parallel, and write what the activity logs hold.
+    pub fn close(mut self) {
+        self.sources.values().for_each(Source::stop_soon);
+        let t = now_ms();
+        for log in self.logs.values_mut() {
+            let _ = log.flush(t);
+        }
+        self.sources.clear(); // joins each camera's thread
     }
 
     /// Whether every camera has stopped for good (files read to their end).
@@ -221,7 +237,10 @@ impl Runner {
         let mut moved: HashMap<String, Vec<BBox>> = HashMap::new();
         if let Some(m) = &mut self.motion {
             for (name, f) in &frames {
-                let g = m.cameras.entry(name.clone()).or_insert_with(|| Gate::new(m.opts.clone(), m.hold));
+                let (opts, hold, masks) = (&m.opts, m.hold, &m.masks);
+                let g = m.cameras.entry(name.clone()).or_insert_with(|| {
+                    Gate::new(MotionOptions { mask: masks.get(name).cloned().unwrap_or_default(), ..opts.clone() }, hold)
+                });
                 if g.next(f) {
                     quiet.insert(name.clone());
                 }
@@ -236,7 +255,8 @@ impl Runner {
         }
         let gate = self.motion.as_ref().is_some_and(|m| m.gate);
         let looks_before = self.tracker.looks();
-        let found = self.tracker.step_gated(&frames, &|c| gate && quiet.contains(c))?;
+        let found = self.tracker.step_regions(&frames, &|c| gate && quiet.contains(c),
+                                              &|c| moved.get(c).cloned().unwrap_or_default())?;
         for c in self.tracker.skipped() {
             self.sources[c].health.looks_skipped.fetch_add(1, Ordering::Relaxed);
         }

@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut det = Detector::new(model, DetectorOptions { threads: Some(2), ..Default::default() })?;
     camera::init(Default::default())?;
     let cam = Camera { name: "eval".into(), url: video.clone(), user: None, password: None, look_every: None, weight: 1.0,
-                       record: false, live: false };
+                       record: false, live: false, motion_mask: Vec::new() };
     let bell = Arc::new(Bell::default());
     // At the file's own frame rate, as a camera sends it; frames that arrive while the
     // detector is busy are replaced, as in the runner.

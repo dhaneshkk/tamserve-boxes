@@ -42,6 +42,7 @@ pub mod http;
 pub mod image;
 mod kalman;
 pub mod motion;
+pub mod regions;
 pub mod restream;
 pub mod retention;
 #[cfg(feature = "cameras")]
