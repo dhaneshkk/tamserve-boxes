@@ -1,0 +1,5 @@
+# /etc/default/zramswap — the same settings for zram-tools, on Ubuntu releases without
+# systemd-zram-generator. See zram-generator.conf for why.
+ALGO=lz4
+PERCENT=25
+PRIORITY=100

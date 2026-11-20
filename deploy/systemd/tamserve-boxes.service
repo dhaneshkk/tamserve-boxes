@@ -1,0 +1,43 @@
+# /etc/systemd/system/tamserve-boxes.service — one box's cameras, kept out of swap.
+#
+# Everything else on the box may swap to zram; the detector may not. A page fault that has to
+# decompress lands in the thread that touched the page, and here that's an inference or decode
+# thread, so it would show up as a late or dropped frame. MemorySwapMax=0 needs cgroup v2,
+# the default since Ubuntu 21.10.
+#
+# For `box` mode, replace ExecStart with:
+#   ExecStart=/usr/local/bin/tamserve-boxes box --config /etc/tamserve/cameras.toml \
+#       --coordinator 10.0.0.2:7400 --token-file /etc/tamserve/coordinator.token --name %H
+
+[Unit]
+Description=tamserve-boxes: YOLOX-Nano box tracking on CCTV cameras
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=tamserve
+Group=tamserve
+# LD_LIBRARY_PATH for OpenVINO's C library, and any password_env variables. Mode 600.
+EnvironmentFile=-/etc/tamserve/env
+ExecStart=/usr/local/bin/tamserve-boxes run --config /etc/tamserve/cameras.toml
+Restart=on-failure
+RestartSec=2
+
+# Memory: never swap the detector, and when memory really runs out, kill something else first.
+MemorySwapMax=0
+OOMScoreAdjust=-500
+# Optional cap, so a leak ends in a restart rather than a box that can't be reached:
+# MemoryMax=2G
+
+# CPU: to leave core 0 to the kernel's reclaim and compression and to other services, pin the
+# detector to the rest, and lower [detector] threads to match. On a 4-core N100: CPUAffinity=1-3
+# and threads = 2, which still leaves one of those cores for decoding.
+# CPUAffinity=1-3
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
