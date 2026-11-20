@@ -14,6 +14,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Deployment scripts
+        run: shellcheck deploy/setup-zram.sh
       - name: GStreamer
         timeout-minutes: 8   # a stuck package mirror or lock fails fast instead of holding the runner for hours
         env:
@@ -28,9 +30,9 @@ jobs:
           fi
           apt="sudo -E apt-get -q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::ForceIPv4=true -o DPkg::Lock::Timeout=120"
           time $apt update
-          # Only what building needs: no CI test decodes video, so the plugins (libav pulls in ~45 ffmpeg
-          # packages, where the runner's mirror stalled) stay out. scripts/rtsp_test.sh is the end-to-end test.
-          time $apt install -y --no-install-recommends libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+          time $apt install -y --no-install-recommends libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly gstreamer1.0-libav
       - name: OpenVINO's C library (from the pip wheel, under the name the bindings look for)
         run: |
           pip install -q "openvino>=2024.0"
@@ -52,3 +54,14 @@ jobs:
       - run: cargo test --release
       - name: Without the optional features
         run: cargo build --release --no-default-features
+
+  proofs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Lean 4.31, core only: every proof"
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain leanprover/lean4:v4.31.0
+          for f in proofs/*.lean; do "$HOME/.elan/bin/lean" "$f"; done
+          ! grep -n "sorry" proofs/*.lean

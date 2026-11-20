@@ -948,6 +948,7 @@ dependencies = [
  "gstreamer-video",
  "hmac",
  "image",
+ "libc",
  "onnx-protobuf",
  "openvino",
  "protobuf",
