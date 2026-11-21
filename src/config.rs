@@ -33,6 +33,13 @@
 //! hold = 10            # frames a camera stays awake after motion
 //! regions = true       # crop looks around motion (see `regions`)
 //!
+//! [light]              # day/night and IR switches (see `light`); on with these defaults
+//! settle_seconds = 2   # after a switch, don't look at the camera for this long (0: never)
+//! night_below = 2.0    # chroma below this looks like IR; above day_above like colour
+//! day_above = 4.0
+//! confirm = 5          # frames in a row before day/night changes
+//! jump = 40            # a brightness jump (0-255) from one frame to the next is a switch
+//!
 //! [record]             # see `retention`
 //! dir = "/var/lib/tamserve/recordings"
 //! all_days = 1
@@ -276,6 +283,18 @@ pub struct MotionSection {
     pub most_regions: Option<usize>,
 }
 
+/// Day and night, and the IR switch between them. Always on; `settle_seconds = 0`
+/// keeps the reporting and stops the settling.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct LightSection {
+    pub settle_seconds: Option<f64>,
+    pub night_below: Option<f32>,
+    pub day_above: Option<f32>,
+    pub confirm: Option<u32>,
+    pub jump: Option<f32>,
+}
+
 /// Recording, and how long recordings are kept.
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -338,6 +357,8 @@ pub struct Config {
     #[serde(default)]
     pub onvif: OnvifSection,
     pub motion: Option<MotionSection>,
+    #[serde(default)]
+    pub light: LightSection,
     pub record: Option<RecordSection>,
     pub encode: Option<EncodeSection>,
     #[serde(default, rename = "camera")]
@@ -557,6 +578,10 @@ impl Config {
         if let Some(m) = &cfg.motion {
             cfg.motion_options_of(m).check()?;
         }
+        if cfg.light.settle_seconds.is_some_and(|s| !(0.0..=3600.0).contains(&s)) {
+            return Err(Error::Invalid("light.settle_seconds must be from 0 to 3600".into()));
+        }
+        cfg.light_options().check()?;
         if let Some(r) = &mut cfg.record {
             if r.dir.is_relative() {
                 r.dir = base.join(&r.dir);
@@ -614,6 +639,18 @@ impl Config {
             alpha: m.alpha.unwrap_or(d.alpha),
             lighting: m.lighting.unwrap_or(d.lighting),
             mask: Vec::new(), // each camera's own, from its `motion_mask`
+        }
+    }
+
+    /// Day, night and IR switches: `[light]`, or its defaults.
+    pub fn light_options(&self) -> crate::light::LightOptions {
+        let (d, l) = (crate::light::LightOptions::default(), &self.light);
+        crate::light::LightOptions {
+            night_below: l.night_below.unwrap_or(d.night_below),
+            day_above: l.day_above.unwrap_or(d.day_above),
+            confirm: l.confirm.unwrap_or(d.confirm),
+            settle_ms: l.settle_seconds.map_or(d.settle_ms, |s| (s * 1000.0).round() as u64),
+            jump: l.jump.unwrap_or(d.jump),
         }
     }
 
@@ -715,6 +752,21 @@ mod tests {
                      "[[camera]]\nname=\"a\"\nurl=\"rtsp://h/1\"\nlook_every=0\n"] {
             let cfg = write(&d, "c.toml", &format!("{HEAD}{body}"), 0o600);
             assert!(Config::load(&cfg).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn light_has_defaults_and_is_checked() {
+        let d = dir();
+        let cam = "[[camera]]\nname=\"a\"\nurl=\"rtsp://h/1\"\n";
+        let (cfg, _) = Config::load(write(&d, "c.toml", &format!("{HEAD}{cam}"), 0o600)).unwrap();
+        assert_eq!(cfg.light_options(), crate::light::LightOptions::default());
+        let (cfg, _) = Config::load(write(&d, "c.toml", &format!("{HEAD}[light]\nsettle_seconds=0.5\nconfirm=3\n{cam}"), 0o600)).unwrap();
+        let l = cfg.light_options();
+        assert_eq!((l.settle_ms, l.confirm, l.night_below), (500, 3, 2.0));
+        for bad in ["settle_seconds=-1", "confirm=0", "night_below=5.0\nday_above=4.0", "jump=300", "colour=true"] {
+            let cfg = write(&d, "c.toml", &format!("{HEAD}[light]\n{bad}\n{cam}"), 0o600);
+            assert!(Config::load(&cfg).is_err(), "{bad}");
         }
     }
 

@@ -111,8 +111,29 @@ How credentials are handled:
 `run` prints one JSON line per camera per step and logs state changes by camera name and host:
 
 ```json
-{"camera":"gate","frame":186,"time_ms":1795072982293,"objects":[{"id":1,"label":"person","score":0.81,"box":[410.2,120.5,560.8,480.1]}]}
+{"camera":"gate","frame":186,"time_ms":1795072982293,"objects":[{"id":1,"label":"person","score":0.81,"box":[410.2,120.5,560.8,480.1]}],"light":"day","settling":false}
 ```
+
+`light` and `settling` are explained under [Day, night and the IR switch](#day-night-and-the-ir-switch).
+
+### Day, night and the IR switch
+
+At dusk a camera takes its IR cut filter out of the light path and turns on its IR LEDs. From then on it sees only brightness: its colour stream carries a gray picture too, so anything that draws boxes on "the colour frame" has no colour to draw on. The switch itself is a jump in exposure that can make the detector see things for a second or two, and can lose what is followed.
+
+Every camera is followed for this, with no setup:
+- **`light`: `"day"`, `"night"` or `"unknown"`.** When the decoder gives the frame's colour planes (NV12, I420: an H.264/H.265 stream, the sub-stream included), how far its chroma is from neutral tells. A camera in IR mode sends neutral chroma. The IR cut filter serves the whole sensor, so a colour sub-stream tells for the main stream too. A stream with no colour planes (a GRAY8 or mono profile) reports `"unknown"`. **Draw on the gray frame whenever `light` isn't `"day"`.**
+- **`settling`.** A switch is a change of mode, motion's lighting reset (most of the picture changed at once), or the mean brightness jumping by more than `jump` between frames. For `settle_seconds` after one the camera is not looked at, and its reports carry the objects from before the switch with the same ids, so a person in a hazard zone doesn't vanish and come back as someone new. Don't raise new alarms on a settling camera.
+
+```toml
+[light]                  # these are the defaults; the section can be left out
+settle_seconds = 2       # 0: report day/night but never settle
+night_below = 2.0        # chroma (mean distance from neutral, 0-128) that looks like IR
+day_above = 4.0          # and like colour; between the two is no evidence either way
+confirm = 5              # frames in a row before day/night changes
+jump = 40                # a brightness change (0-255) between frames that counts as a switch; 0: off
+```
+
+The mode changes only after `confirm` frames in a row agree, and only past two thresholds with a gap between them, so a dull or dim colour scene doesn't flicker. [`proofs/Light.lean`](proofs/Light.lean) proves it: values between the thresholds never change the mode, fewer than `confirm` frames never do, and `confirm` agreeing frames always do. `tests/light.rs` runs a clip through the real decoder, colour bars and then the same bars with the colour taken out, and checks for one switch from day to night.
 
 ### Health and metrics
 
@@ -120,7 +141,7 @@ With `[http] listen` set (127.0.0.1 by default; add `token_file` to require a be
 
 | endpoint | what |
 |---|---|
-| `GET /metrics` | Prometheus, per camera: `tamserve_camera_up`, `_state{state=…}`, `_frames_decoded_total`, `_frames_used_total`, `_reconnects_total`, `_frame_age_seconds`, `_objects`; with `[motion]`, `_moving`, `_motion_steps_total`, `_looks_skipped_total`, `_lighting_resets_total`; with recording and live view, `_segments_total`, `_live_viewers`, `_live_bytes_total`. Per loop: `tamserve_steps_total`, `tamserve_step_seconds_total`/`_last`, `tamserve_looks_total`. With `[record]`: `tamserve_recordings_bytes`, `_segments`, `_pinned`, `_deleted_total{why=expired\|space}`, `_sweep_errors_total` |
+| `GET /metrics` | Prometheus, per camera: `tamserve_camera_up`, `_state{state=…}`, `_frames_decoded_total`, `_frames_used_total`, `_reconnects_total`, `_frame_age_seconds`, `_objects`, `_light_mode` (0 unknown, 1 day, 2 night), `_light_switches_total`, `_settling`; with `[motion]`, `_moving`, `_motion_steps_total`, `_looks_skipped_total`, `_lighting_resets_total`; with recording and live view, `_segments_total`, `_live_viewers`, `_live_bytes_total`. Per loop: `tamserve_steps_total`, `tamserve_step_seconds_total`/`_last`, `tamserve_looks_total`. With `[record]`: `tamserve_recordings_bytes`, `_segments`, `_pinned`, `_deleted_total{why=expired\|space}`, `_sweep_errors_total` |
 | `GET /status` | the same as JSON, with each camera's last error and latest objects |
 | `GET /live/<camera>.ts` | a camera with `live = true`, as MPEG-TS from the box's own connection: `ffplay`, VLC, mpv or mpegts.js. At most 8 viewers per camera and per box; a viewer who falls behind is dropped |
 | `GET /v1/models` and `POST /v1/chat/completions` | OpenAI-compatible. `model` is a camera's name or `"all"`, and the reply's message is that camera's latest objects and health as JSON |
@@ -211,7 +232,7 @@ tamserve-boxes sweep --config cameras.toml --dry-run   # what would go now, as J
 - the space rule frees only what expires no later than everything it keeps.
 
 ```bash
-lean proofs/Retention.lean && lean proofs/Regions.lean
+lean proofs/Retention.lean && lean proofs/Regions.lean && lean proofs/Light.lean
 ```
 
 [`notebooks/motion_record_live.ipynb`](notebooks/motion_record_live.ipynb) is one Colab cell that does all of this on a test clip. It measures the gate against the detector (MCC), runs a box that records and streams, reads it back through `/v1/chat/completions`, sweeps the recordings, and checks the proof. Set `TSB_BRANCH` to try a branch.

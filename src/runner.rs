@@ -7,6 +7,11 @@
 //! [`with_recording`](Runner::with_recording), what each recording camera showed is
 //! written to its activity log, and a sweeper thread deletes recordings by
 //! [`crate::retention`]'s rules.
+//!
+//! Every camera's day or night mode and its IR switches are followed by
+//! [`crate::light`]: each report says which mode the camera is in (`light`) and whether
+//! it is `settling` after a switch. A settling camera is not looked at, and its report
+//! carries the objects it showed before the switch, so they keep their ids.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -18,6 +23,7 @@ use serde::Serialize;
 
 use crate::camera::{now_ms, Bell, Health, Opening, Source, State};
 use crate::config::Camera;
+use crate::light::{mean_luma, LightMeter, LightOptions, Mode};
 use crate::motion::{Gate, MotionOptions};
 use crate::restream::{Chunk, Tap};
 use crate::retention::{ActivityLog, Policy, Sweep};
@@ -32,6 +38,12 @@ pub struct Report {
     /// When the step that produced it finished, in ms since 1970.
     pub time_ms: u64,
     pub objects: Vec<Object>,
+    /// The camera's mode: "day", "night" (IR: its colour stream is gray too) or "unknown"
+    /// (a gray stream, or not decided yet). Draw on the gray frame when it is not "day".
+    pub light: Mode,
+    /// Within a few seconds of the light switching: `objects` are the ones from before
+    /// the switch, not looked for again until it settles.
+    pub settling: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -86,6 +98,11 @@ struct Motion {
     masks: HashMap<String, Vec<[f32; 4]>>,
 }
 
+struct Lights {
+    opts: LightOptions,
+    cameras: HashMap<String, LightMeter>,
+}
+
 /// Serves cameras on this box.
 pub struct Runner {
     tracker: BoxTracker<Detector, String>,
@@ -95,6 +112,7 @@ pub struct Runner {
     rung: u64,
     generation: HashMap<String, u64>,
     motion: Option<Motion>,
+    light: Lights,
     record: Option<PathBuf>,
     logs: HashMap<String, ActivityLog>,
     pub shared: Arc<Shared>,
@@ -105,7 +123,17 @@ impl Runner {
         let shared = Arc::new(Shared::default());
         shared.started_ms.store(now_ms(), Ordering::Relaxed);
         Runner { tracker, sources: BTreeMap::new(), opening, bell: Arc::new(Bell::default()), rung: 0,
-                 generation: HashMap::new(), motion: None, record: None, logs: HashMap::new(), shared }
+                 generation: HashMap::new(), motion: None,
+                 light: Lights { opts: LightOptions::default(), cameras: HashMap::new() },
+                 record: None, logs: HashMap::new(), shared }
+    }
+
+    /// How day, night and IR switches are found ([`crate::light`]). Without this, the
+    /// defaults.
+    pub fn with_light(mut self, opts: LightOptions) -> Result<Runner> {
+        opts.check()?;
+        self.light = Lights { opts, cameras: HashMap::new() };
+        Ok(self)
     }
 
     /// Find motion on every frame; with `gate`, a camera that has not moved for more than
@@ -164,6 +192,7 @@ impl Runner {
             self.sources.remove(n); // stops its thread
             self.tracker.drop_camera(n);
             self.generation.remove(n);
+            self.light.cameras.remove(n);
             if let Some(m) = &mut self.motion {
                 m.cameras.remove(n);
                 m.masks.remove(n);
@@ -221,6 +250,9 @@ impl Runner {
                     if let Some(g) = self.motion.as_mut().and_then(|m| m.cameras.get_mut(name)) {
                         g.reset();
                     }
+                    if let Some(l) = self.light.cameras.get_mut(name) {
+                        l.reconnected();
+                    }
                 }
                 s.health.used.fetch_add(1, Ordering::Relaxed);
                 taken.push((name.clone(), f));
@@ -253,10 +285,25 @@ impl Runner {
                 moved.insert(name.clone(), g.last.boxes.clone());
             }
         }
+        // Day, night, and the light switching: a settling camera is not looked at.
+        let now = now_ms();
+        let mut lights: HashMap<String, crate::light::Light> = HashMap::with_capacity(frames.len());
+        for ((name, f), (_, raw)) in frames.iter().zip(&taken) {
+            let lighting = self.motion.as_ref().and_then(|m| m.cameras.get(name)).is_some_and(|g| g.last.lighting);
+            let opts = &self.light.opts;
+            let meter = self.light.cameras.entry(name.clone()).or_insert_with(|| LightMeter::new(opts.clone()));
+            let l = meter.next(now, raw.chroma, mean_luma(f), lighting);
+            let h = &self.sources[name].health;
+            h.light_mode.store(l.mode.code(), Ordering::Relaxed);
+            h.light_switches.store(meter.switches, Ordering::Relaxed);
+            h.settling.store(l.settling, Ordering::Relaxed);
+            lights.insert(name.clone(), l);
+        }
+        let looked: Vec<(String, GrayFrame)> = frames.iter().filter(|(n, _)| !lights[n].settling).cloned().collect();
         let gate = self.motion.as_ref().is_some_and(|m| m.gate);
         let looks_before = self.tracker.looks();
-        let found = self.tracker.step_regions(&frames, &|c| gate && quiet.contains(c),
-                                              &|c| moved.get(c).cloned().unwrap_or_default())?;
+        let mut found = self.tracker.step_regions(&looked, &|c| gate && quiet.contains(c),
+                                                  &|c| moved.get(c).cloned().unwrap_or_default())?;
         for c in self.tracker.skipped() {
             self.sources[c].health.looks_skipped.fetch_add(1, Ordering::Relaxed);
         }
@@ -270,8 +317,14 @@ impl Runner {
         let mut reports = Vec::with_capacity(taken.len());
         let mut views = sh.cameras.lock().unwrap();
         for (name, f) in &taken {
-            let objects = found[name].iter().map(|(&id, o)| Object { id, label: o.label.clone(), score: o.score, bbox: o.bbox }).collect();
-            let r: Report = Report { camera: name.clone(), frame: f.number, time_ms: t, objects };
+            let light = lights[name];
+            let objects = match found.remove(name) {
+                Some(seen) => seen.iter().map(|(&id, o)| Object { id, label: o.label.clone(), score: o.score, bbox: o.bbox }).collect(),
+                // Settling: what it showed before the switch.
+                None => views.get(name).and_then(|v| v.latest.as_ref()).map(|r| r.objects.clone()).unwrap_or_default(),
+            };
+            let r: Report = Report { camera: name.clone(), frame: f.number, time_ms: t, objects,
+                                     light: light.mode, settling: light.settling };
             let motion = moved.remove(name).unwrap_or_default();
             if let Some(log) = self.logs.get_mut(name) {
                 let mut labels: Vec<String> = r.objects.iter().map(|o| o.label.clone()).collect();
@@ -298,7 +351,7 @@ impl crate::http::Source for Shared {
         use std::fmt::Write;
         let mut m = String::new();
         let cams = self.cameras.lock().unwrap();
-        let series: [(&str, &str, &str); 17] = [
+        let series: [(&str, &str, &str); 20] = [
             ("tamserve_camera_encoded_frames_total", "counter", "frames the camera's encoder produced"),
             ("tamserve_camera_encoded_bytes_total", "counter", "bytes the camera's encoder produced"),
             ("tamserve_camera_encode_dropped_total", "counter", "times the encoder's backlog was full and a frame was dropped instead of stalling decoding"),
@@ -313,6 +366,9 @@ impl crate::http::Source for Shared {
             ("tamserve_camera_motion_steps_total", "counter", "steps on which the frame moved"),
             ("tamserve_camera_looks_skipped_total", "counter", "looks not made: quiet, with nothing followed"),
             ("tamserve_camera_lighting_resets_total", "counter", "times the whole picture changed at once and motion started over"),
+            ("tamserve_camera_light_mode", "gauge", "0 unknown (a gray stream), 1 day, 2 night (IR)"),
+            ("tamserve_camera_light_switches_total", "counter", "times the light switched (IR cut filter, floodlights) and the camera settled"),
+            ("tamserve_camera_settling", "gauge", "1 while the camera settles after a switch and is not looked at"),
             ("tamserve_camera_segments_total", "counter", "recorded segments started"),
             ("tamserve_camera_live_viewers", "gauge", "viewers of GET /live/<camera>.ts"),
             ("tamserve_camera_live_bytes_total", "counter", "bytes sent to live viewers, counted once per chunk"),
@@ -339,6 +395,9 @@ impl crate::http::Source for Shared {
                     "tamserve_camera_motion_steps_total" => writeln!(m, "{name}{{camera=\"{c}\"}} {}", h.motion_steps.load(Ordering::Relaxed)),
                     "tamserve_camera_looks_skipped_total" => writeln!(m, "{name}{{camera=\"{c}\"}} {}", h.looks_skipped.load(Ordering::Relaxed)),
                     "tamserve_camera_lighting_resets_total" => writeln!(m, "{name}{{camera=\"{c}\"}} {}", h.lighting_resets.load(Ordering::Relaxed)),
+                    "tamserve_camera_light_mode" => writeln!(m, "{name}{{camera=\"{c}\"}} {}", h.light_mode.load(Ordering::Relaxed)),
+                    "tamserve_camera_light_switches_total" => writeln!(m, "{name}{{camera=\"{c}\"}} {}", h.light_switches.load(Ordering::Relaxed)),
+                    "tamserve_camera_settling" => writeln!(m, "{name}{{camera=\"{c}\"}} {}", u8::from(h.settling.load(Ordering::Relaxed))),
                     "tamserve_camera_segments_total" => writeln!(m, "{name}{{camera=\"{c}\"}} {}", h.segments.load(Ordering::Relaxed)),
                     "tamserve_camera_live_viewers" => match &v.live {
                         Some(t) => writeln!(m, "{name}{{camera=\"{c}\"}} {}", t.viewers()),
@@ -404,6 +463,9 @@ impl crate::http::Source for Shared {
                 "moving": h.moving.load(Ordering::Relaxed),
                 "motion": v.motion,
                 "looks_skipped": h.looks_skipped.load(Ordering::Relaxed),
+                "light": (["unknown", "day", "night"].get(h.light_mode.load(Ordering::Relaxed) as usize)),
+                "light_switches": h.light_switches.load(Ordering::Relaxed),
+                "settling": h.settling.load(Ordering::Relaxed),
                 "segments": h.segments.load(Ordering::Relaxed),
                 "live_viewers": v.live.as_ref().map(|t| t.viewers()),
             }))
