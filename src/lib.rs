@@ -41,6 +41,7 @@ pub mod fold;
 pub mod http;
 pub mod image;
 mod kalman;
+pub mod light;
 pub mod motion;
 pub mod regions;
 pub mod restream;

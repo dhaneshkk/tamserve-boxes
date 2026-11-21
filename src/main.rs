@@ -201,6 +201,7 @@ fn stopping() -> bool {
 /// `[motion]` and `[record]`, if the config has them.
 #[cfg(feature = "cameras")]
 fn with_extras(mut runner: tamserve_boxes::runner::Runner, cfg: &tamserve_boxes::config::Config) -> Res<tamserve_boxes::runner::Runner> {
+    runner = runner.with_light(cfg.light_options())?;
     if let (Some(opts), Some(m)) = (cfg.motion_options(), &cfg.motion) {
         runner = runner.with_motion(opts, m.gate, m.hold)?;
     }

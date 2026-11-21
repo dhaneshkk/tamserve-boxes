@@ -103,6 +103,12 @@ pub struct Health {
     pub lighting_resets: AtomicU64,
     /// 1 while motion is held open.
     pub moving: AtomicBool,
+    /// [`crate::light::Mode::code`]: 0 unknown, 1 day, 2 night (IR).
+    pub light_mode: AtomicU8,
+    /// Times the light switched (IR cut filter, floodlights) and a settle started.
+    pub light_switches: AtomicU64,
+    /// 1 while the camera is settling after a switch and is not looked at.
+    pub settling: AtomicBool,
     /// Frames and bytes the encoder has produced (cameras with `encode = true`).
     pub encoded: AtomicU64,
     pub encoded_bytes: AtomicU64,
@@ -141,6 +147,9 @@ pub struct Frame {
     /// The frame's number on this connection, from 1.
     pub number: u64,
     pub generation: u64,
+    /// How far its colour is from neutral ([`crate::light::chroma`]), when the decoder
+    /// gave colour planes; `None` for a gray stream.
+    pub chroma: Option<f32>,
 }
 
 /// Wakes the step loop when any camera has a new frame.
@@ -778,7 +787,8 @@ fn stream(camera: &Camera, target: &str, how: &Opening, health: &Arc<Health>, ne
             pixels[r * w..(r + 1) * w].copy_from_slice(&y[r * stride..r * stride + w]);
         }
         count += 1;
-        *slot = Some(Frame { pixels, width: w, height: ht, number: count, generation });
+        let chroma = chroma_of(&frame, &info);
+        *slot = Some(Frame { pixels, width: w, height: ht, number: count, generation, chroma });
         drop(slot);
         let t = now_ms();
         h.decoded.fetch_add(1, Ordering::Relaxed);
@@ -834,6 +844,26 @@ fn stream(camera: &Camera, target: &str, how: &Opening, health: &Arc<Health>, ne
 
 /// End a shared pipeline cleanly when it is stopped: an end of stream down every branch,
 /// so the recorder closes its open segment whole. Waits at most 3 s for it.
+/// The [`crate::light::chroma`] score of a decoded frame, if it has colour planes.
+fn chroma_of(frame: &gst_video::VideoFrameRef<&gst::BufferRef>, info: &gst_video::VideoInfo) -> Option<f32> {
+    use crate::light::{chroma, Chroma};
+    use gst_video::VideoFormat as F;
+    let (cw, ch) = ((info.width() as usize).div_ceil(2), (info.height() as usize).div_ceil(2));
+    let stride = |i: usize| frame.plane_stride()[i] as usize;
+    match info.format() {
+        F::Nv12 | F::Nv21 => {
+            let plane = frame.plane_data(1).ok()?;
+            Some(chroma(&Chroma::Interleaved { plane, stride: stride(1), width: cw, height: ch }))
+        }
+        F::I420 | F::Yv12 => {
+            // YV12 has V before U; the score weighs both alike, so the order does not matter.
+            let (u, v) = (frame.plane_data(1).ok()?, frame.plane_data(2).ok()?);
+            Some(chroma(&Chroma::Planar { u, u_stride: stride(1), v, v_stride: stride(2), width: cw, height: ch }))
+        }
+        _ => None,
+    }
+}
+
 fn finish(pipeline: &gst::Pipeline, bus: &gst::Bus) {
     if !pipeline.send_event(gst::event::Eos::new()) {
         return;

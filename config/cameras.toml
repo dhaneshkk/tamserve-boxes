@@ -28,6 +28,13 @@ listen = "127.0.0.1:9300"        # /metrics (Prometheus), /status, /v1/chat/comp
 hold = 10                        # frames a camera stays awake after it last moved
 # regions = true                 # crop looks around motion and what is followed: for main streams
 
+# [light]                        # day/night and the IR switch; on with these defaults
+# settle_seconds = 2             # after a switch, the camera is not looked at for this long (0: never)
+# night_below = 2.0              # chroma below this looks like IR, above day_above like colour
+# day_above = 4.0
+# confirm = 5                    # frames in a row before day/night changes
+# jump = 40                      # a brightness jump between frames that counts as a switch (0: off)
+
 [record]
 dir = "/var/lib/tamserve/recordings"
 segment_seconds = 10
