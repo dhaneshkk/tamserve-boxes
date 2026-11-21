@@ -239,7 +239,7 @@ pub fn chroma(c: &Chroma) -> f32 {
         Chroma::Interleaved { plane, stride, width, height } => {
             for r in (0..height).step_by(4) {
                 let row = &plane[r * stride..r * stride + 2 * width];
-                for pair in row.chunks_exact(2).step_by(4) {
+                for pair in row.as_chunks::<2>().0.iter().step_by(4) {
                     add(pair[0]);
                     add(pair[1]);
                 }
