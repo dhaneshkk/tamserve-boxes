@@ -312,7 +312,20 @@ fn usage(pid: u32) -> (f64, u64) {
 /// Frames for synthetic cameras: `picture` moving right over a smooth background, 720p.
 fn synthetic(picture: &(Vec<u8>, usize, usize), seed: usize, n: usize) -> Vec<Vec<u8>> {
     let (w, h) = (1280usize, 720usize);
-    let (p, pw, ph) = picture;
+    // The picture moves across the frame below a 60-row band and needs room to move: one
+    // that does not fit with 80 columns to spare is scaled down to fit.
+    let fitted;
+    let (p, pw, ph) = if picture.1 + 80 > w || picture.2 + 60 > h {
+        let r = ((w - 80) as f64 / picture.1 as f64).min((h - 60) as f64 / picture.2 as f64);
+        let (fw, fh) = (((picture.1 as f64 * r) as usize).max(1), ((picture.2 as f64 * r) as usize).max(1));
+        let mut out = vec![0u8; fw * fh];
+        let frame = GrayFrame::new(&picture.0, picture.1, picture.2).expect("a PGM's pixels fill its size");
+        tamserve_boxes::image::resize_linear(&frame, fw, fh, &mut out);
+        fitted = (out, fw, fh);
+        (&fitted.0, &fitted.1, &fitted.2)
+    } else {
+        (&picture.0, &picture.1, &picture.2)
+    };
     let bg: Vec<u8> = (0..w * h).map(|i| { let (x, y) = (i % w, i / w); (90 + (x * 60 / w) as u32 + (y * 40 / h) as u32) as u8 }).collect();
     (0..n).map(|k| {
         let mut f = bg.clone();
@@ -665,5 +678,22 @@ fn coordinator(a: &Args) -> Res<()> {
     }
     loop {
         std::thread::park();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::synthetic;
+
+    #[test]
+    fn bench_frames_take_pictures_of_any_size() {
+        for (pw, ph) in [(64, 48), (1200, 660), (1201, 661), (1280, 720), (1920, 1080), (4000, 30)] {
+            let picture = (vec![200u8; pw * ph], pw, ph);
+            let frames = synthetic(&picture, 3, 5);
+            assert_eq!(frames.len(), 5);
+            assert!(frames.iter().all(|f| f.len() == 1280 * 720), "{pw}x{ph}");
+            // The picture is in there, not only the background (which is never above 190).
+            assert!(frames[0].contains(&200), "{pw}x{ph}");
+        }
     }
 }

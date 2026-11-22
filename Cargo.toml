@@ -40,6 +40,8 @@ url = { version = "2", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }
 reqwest = { version = "0.13", default-features = false, optional = true }  # onvif-rs's, for its Certificate type
+fearless_simd = "1"
+fearless_simd_macros = "0.1"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
