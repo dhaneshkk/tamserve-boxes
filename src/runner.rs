@@ -12,6 +12,12 @@
 //! [`crate::light`]: each report says which mode the camera is in (`light`) and whether
 //! it is `settling` after a switch. A settling camera is not looked at, and its report
 //! carries the objects it showed before the switch, so they keep their ids.
+//!
+//! A camera with `safety` in its config also runs the safety rules ([`crate::safety`]) on
+//! its objects: line of fire, red zone, barricade closure and PPE, in metres on the floor.
+//! Their verdicts are in its report (`safety`), on `/status`, on `/v1/chat/completions` and
+//! in `tamserve_safety_*` metrics. A drift check posted to `POST /safety/<camera>/drift`
+//! is applied on the camera's next step.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -26,7 +32,9 @@ use crate::config::Camera;
 use crate::light::{mean_luma, LightMeter, LightOptions, Mode};
 use crate::motion::{Gate, MotionOptions};
 use crate::restream::{Chunk, Tap};
+use crate::lens::{CalibState, DriftEstimate};
 use crate::retention::{ActivityLog, Policy, Sweep};
+use crate::safety::{CameraSafety, SafetyCam, SafetySpec};
 use crate::{BBox, BoxTracker, Detector, GrayFrame, Result};
 
 /// One camera's objects on one frame.
@@ -44,6 +52,9 @@ pub struct Report {
     /// Within a few seconds of the light switching: `objects` are the ones from before
     /// the switch, not looked for again until it settles.
     pub settling: bool,
+    /// The safety rules' verdicts, for a camera with `safety` in its config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety: Option<CameraSafety>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -66,6 +77,8 @@ pub struct Shared {
     pub looks: AtomicU64,
     pub started_ms: AtomicU64,
     pub recordings: Mutex<Recordings>,
+    /// Drift checks posted to `POST /safety/<camera>/drift`, waiting for the camera's next step.
+    pub drift: Mutex<HashMap<String, DriftEstimate>>,
 }
 
 /// The sweeper's counts, for the metrics.
@@ -88,6 +101,8 @@ pub struct View {
     /// Where the latest frame moved, when `[motion]` is on.
     pub motion: Vec<BBox>,
     pub live: Option<Arc<Tap>>,
+    /// Whether the camera runs the safety rules.
+    pub safety: bool,
 }
 
 struct Motion {
@@ -115,6 +130,7 @@ pub struct Runner {
     light: Lights,
     record: Option<PathBuf>,
     logs: HashMap<String, ActivityLog>,
+    safety: HashMap<String, SafetyCam>,
     pub shared: Arc<Shared>,
 }
 
@@ -125,7 +141,7 @@ impl Runner {
         Runner { tracker, sources: BTreeMap::new(), opening, bell: Arc::new(Bell::default()), rung: 0,
                  generation: HashMap::new(), motion: None,
                  light: Lights { opts: LightOptions::default(), cameras: HashMap::new() },
-                 record: None, logs: HashMap::new(), shared }
+                 record: None, logs: HashMap::new(), safety: HashMap::new(), shared }
     }
 
     /// How day, night and IR switches are found ([`crate::light`]). Without this, the
@@ -193,6 +209,8 @@ impl Runner {
             self.tracker.drop_camera(n);
             self.generation.remove(n);
             self.light.cameras.remove(n);
+            self.safety.remove(n);
+            self.shared.drift.lock().unwrap().remove(n);
             if let Some(m) = &mut self.motion {
                 m.cameras.remove(n);
                 m.masks.remove(n);
@@ -207,9 +225,14 @@ impl Runner {
             if self.sources.contains_key(&c.name) {
                 continue;
             }
+            let safety = c.safety.as_deref().map(SafetySpec::load).transpose()?;
             let s = Source::open(c.clone(), &self.opening, self.bell.clone())?;
             self.shared.cameras.lock().unwrap().insert(c.name.clone(),
-                View { label: c.label(), health: s.health.clone(), latest: None, motion: Vec::new(), live: s.live.clone() });
+                View { label: c.label(), health: s.health.clone(), latest: None, motion: Vec::new(), live: s.live.clone(),
+                       safety: safety.is_some() });
+            if let Some(spec) = safety {
+                self.safety.insert(c.name.clone(), SafetyCam::new(spec));
+            }
             if let Some(m) = &mut self.motion {
                 m.masks.insert(c.name.clone(), c.motion_mask.clone());
             }
@@ -252,6 +275,9 @@ impl Runner {
                     }
                     if let Some(l) = self.light.cameras.get_mut(name) {
                         l.reconnected();
+                    }
+                    if let Some(sc) = self.safety.get_mut(name) {
+                        sc.reset();
                     }
                 }
                 s.health.used.fetch_add(1, Ordering::Relaxed);
@@ -323,8 +349,18 @@ impl Runner {
                 // Settling: what it showed before the switch.
                 None => views.get(name).and_then(|v| v.latest.as_ref()).map(|r| r.objects.clone()).unwrap_or_default(),
             };
+            let safety = match self.safety.get_mut(name) {
+                // Settling: nothing was looked at, so the rules keep their last verdicts.
+                Some(_) if light.settling => views.get(name).and_then(|v| v.latest.as_ref()).and_then(|r| r.safety.clone()),
+                Some(sc) => {
+                    let drift = sh.drift.lock().unwrap().remove(name);
+                    let dets = sc.detections(objects.iter().map(|o| (o.label.as_str(), o.score, o.bbox)));
+                    Some(sc.process(name, &dets, drift.as_ref()))
+                }
+                None => None,
+            };
             let r: Report = Report { camera: name.clone(), frame: f.number, time_ms: t, objects,
-                                     light: light.mode, settling: light.settling };
+                                     light: light.mode, settling: light.settling, safety };
             let motion = moved.remove(name).unwrap_or_default();
             if let Some(log) = self.logs.get_mut(name) {
                 let mut labels: Vec<String> = r.objects.iter().map(|o| o.label.clone()).collect();
@@ -416,6 +452,40 @@ impl crate::http::Source for Shared {
                 };
             }
         }
+        let safe: Vec<(&String, &CameraSafety)> = cams.iter().filter_map(|(n, v)| v.latest.as_ref()?.safety.as_ref().map(|s| (n, s))).collect();
+        if !safe.is_empty() {
+            let _ = writeln!(m, "# HELP tamserve_safety_line_of_fire people in a forklift's line of fire\n# TYPE tamserve_safety_line_of_fire gauge");
+            for (cam, s) in &safe {
+                let n = s.report.workers.iter().filter(|w| w.line_of_fire == crate::grammar::Tri::Yes).count();
+                let _ = writeln!(m, "tamserve_safety_line_of_fire{{camera=\"{}\"}} {n}", label(cam));
+            }
+            let _ = writeln!(m, "# HELP tamserve_safety_red_zone people in a red zone\n# TYPE tamserve_safety_red_zone gauge");
+            for (cam, s) in &safe {
+                let n = s.report.workers.iter().filter(|w| w.red_zone == crate::grammar::Tri::Yes).count();
+                let _ = writeln!(m, "tamserve_safety_red_zone{{camera=\"{}\"}} {n}", label(cam));
+            }
+            let _ = writeln!(m, "# HELP tamserve_safety_perimeter_breach 1 while the barricade is open; absent while unknown\n# TYPE tamserve_safety_perimeter_breach gauge");
+            for (cam, s) in &safe {
+                if let Some(b) = s.report.perimeter.breach {
+                    let _ = writeln!(m, "tamserve_safety_perimeter_breach{{camera=\"{}\"}} {}", label(cam), u8::from(b));
+                }
+            }
+            let _ = writeln!(m, "# HELP tamserve_safety_calibration 1 for the floor calibration's state: ok, corrected, unknown\n# TYPE tamserve_safety_calibration gauge");
+            for (cam, s) in &safe {
+                for (st, name) in [(CalibState::Ok, "ok"), (CalibState::Corrected, "corrected"), (CalibState::Unknown, "unknown")] {
+                    let _ = writeln!(m, "tamserve_safety_calibration{{camera=\"{}\",state=\"{name}\"}} {}", label(cam), u8::from(s.report.calibration == st));
+                }
+            }
+            let _ = writeln!(m, "# HELP tamserve_safety_ppe people by helmet and vest verdict, after filling short gaps\n# TYPE tamserve_safety_ppe gauge");
+            for (cam, s) in &safe {
+                for (item, pick) in [("helmet", 0usize), ("vest", 1)] {
+                    for (v, name) in [(crate::grammar::Ppe::Compliant, "compliant"), (crate::grammar::Ppe::Violation, "violation"), (crate::grammar::Ppe::Unknown, "unknown")] {
+                        let n = s.ppe_fused.iter().filter(|w| (if pick == 0 { w.helmet } else { w.vest }).verdict == v).count();
+                        let _ = writeln!(m, "tamserve_safety_ppe{{camera=\"{}\",item=\"{item}\",verdict=\"{name}\"}} {n}", label(cam));
+                    }
+                }
+            }
+        }
         let steps = self.steps.load(Ordering::Relaxed);
         let _ = writeln!(m, "# HELP tamserve_steps_total steps the loop has run\n# TYPE tamserve_steps_total counter\ntamserve_steps_total {steps}");
         let _ = writeln!(m, "# HELP tamserve_step_seconds_total time spent in steps\n# TYPE tamserve_step_seconds_total counter\ntamserve_step_seconds_total {:.6}",
@@ -436,6 +506,14 @@ impl crate::http::Source for Shared {
             let _ = writeln!(m, "# HELP tamserve_recordings_sweep_errors_total sweeps that failed\n# TYPE tamserve_recordings_sweep_errors_total counter\ntamserve_recordings_sweep_errors_total {}", r.errors);
         }
         m
+    }
+
+    fn drift(&self, camera: &str, est: DriftEstimate) -> bool {
+        if !self.cameras.lock().unwrap().get(camera).is_some_and(|v| v.safety) {
+            return false;
+        }
+        self.drift.lock().unwrap().insert(camera.to_string(), est);
+        true
     }
 
     fn live(&self, camera: &str) -> std::result::Result<std::sync::mpsc::Receiver<Chunk>, crate::http::LiveRefused> {

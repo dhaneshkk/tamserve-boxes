@@ -20,6 +20,10 @@ What is proved:
 5. **A lost calibration decides nothing.** While the drift check cannot confirm the view, no
    floor rule says "clear" or "alarm" (`lost_never_clear`, `lost_never_alarm`); once it is
    trusted again, verdicts pass through unchanged (`trusted_passes`).
+6. **Fusion never hides or invents.** Filling a PPE gap from remembered evidence keeps the
+   current verdict when there is one (`fuse_keeps_violation`, `fuse_keeps_compliant`), lets
+   stale evidence expire (`fuse_stale_is_unknown`), and a filled "compliant" always has a
+   decided witness inside the window (`fuse_compliant_has_witness`).
 -/
 
 def stepS (S : Nat) : Bool → Nat → Nat
@@ -190,7 +194,36 @@ theorem trusted_passes (c : Calib) (b : Bool) (h : c ≠ Calib.unknown) :
   | ok        => cases b <;> rfl
   | corrected => cases b <;> rfl
 
+-- (6) PPE fusion. The current verdict of the camera watching the person always stands; remembered evidence
+--     (its own last clear look, or the entry camera) only fills an UNKNOWN, and only while fresh. So a filled
+--     "compliant" always has a decided witness no older than the window, and a current violation is never hidden.
+def fuse (main mem : PPE) (age window : Nat) : PPE :=
+  match main with
+  | .compliant => .compliant
+  | .violation => .violation
+  | .unknown   => if age ≤ window then mem else .unknown
+
+theorem fuse_keeps_violation (mem : PPE) (age w : Nat) : fuse PPE.violation mem age w = PPE.violation := rfl
+
+theorem fuse_keeps_compliant (mem : PPE) (age w : Nat) : fuse PPE.compliant mem age w = PPE.compliant := rfl
+
+theorem fuse_stale_is_unknown (mem : PPE) (age w : Nat) (h : w < age) : fuse PPE.unknown mem age w = PPE.unknown := by
+  show (if age ≤ w then mem else PPE.unknown) = PPE.unknown
+  rw [if_neg (by omega)]
+
+theorem fuse_compliant_has_witness (main mem : PPE) (age w : Nat) (h : fuse main mem age w = PPE.compliant) :
+    main = PPE.compliant ∨ (main = PPE.unknown ∧ mem = PPE.compliant ∧ age ≤ w) := by
+  cases main with
+  | compliant => exact Or.inl rfl
+  | violation => cases h
+  | unknown =>
+      have h' : (if age ≤ w then mem else PPE.unknown) = PPE.compliant := h
+      by_cases ha : age ≤ w
+      · rw [if_pos ha] at h'; exact Or.inr ⟨rfl, h', ha⟩
+      · rw [if_neg ha] at h'; cases h'
+
 #print axioms no_fast_rise
+#print axioms fuse_compliant_has_witness
 #print axioms lost_never_clear
 #print axioms valid_all_free
 #print axioms persistent_fires

@@ -276,8 +276,13 @@ impl PpeHead {
     }
 
     pub fn decide(&self, f: &[f32], occluded: bool) -> Ppe {
+        self.decide_with_p(f, occluded).0
+    }
+
+    /// The verdict and the model's probability of a violation.
+    pub fn decide_with_p(&self, f: &[f32], occluded: bool) -> (Ppe, f32) {
         let p = self.proba(f);
-        decide_ppe(occluded, ((1.0f32 - p[0]) as f64) <= self.q[0], ((1.0f32 - p[1]) as f64) <= self.q[1])
+        (decide_ppe(occluded, ((1.0f32 - p[0]) as f64) <= self.q[0], ((1.0f32 - p[1]) as f64) <= self.q[1]), p[1])
     }
 }
 
@@ -316,6 +321,215 @@ pub struct Detection {
     pub bbox: [f64; 4],
 }
 
+/// Where to look for a person's helmet and vest on the full-resolution stream.
+///
+/// The tracker runs on the small grey substream, where a far worker's head is a few pixels:
+/// in simulation, helmet MCC was 0.58 there against 0.95 on a 4x crop of the same person from
+/// the main stream. So for each confirmed person, crop the head-and-torso band from the
+/// matching full-resolution frame, run the PPE detector on the crop, and map its finds back
+/// to substream pixels with [`PpeCrop::map_back`]; the engine then takes them like any find.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PpeCrop {
+    /// left, top, right, bottom in full-resolution pixels.
+    pub rect: [f64; 4],
+    /// Full-resolution pixels per substream pixel.
+    pub scale: f64,
+}
+
+impl PpeCrop {
+    /// The band from 10 % above the person's box to 65 % down it, with 25 % margin each side,
+    /// scaled to the full-resolution frame and clamped to it.
+    pub fn for_person(person: &[f64; 4], scale: f64, full_w: f64, full_h: f64) -> Self {
+        let [x1, y1, x2, y2] = *person;
+        let (h, w) = (y2 - y1, x2 - x1);
+        let r = [(x1 - 0.25 * w) * scale, (y1 - 0.10 * h) * scale, (x2 + 0.25 * w) * scale, (y1 + 0.65 * h) * scale];
+        PpeCrop { rect: [r[0].max(0.0), r[1].max(0.0), r[2].min(full_w), r[3].min(full_h)], scale }
+    }
+
+    /// The crop as whole pixels: x, y, width, height (at least 1 x 1).
+    pub fn pixels(&self) -> (u32, u32, u32, u32) {
+        let (x0, y0) = (self.rect[0].floor().max(0.0), self.rect[1].floor().max(0.0));
+        let (x1, y1) = (self.rect[2].ceil(), self.rect[3].ceil());
+        (x0 as u32, y0 as u32, ((x1 - x0) as u32).max(1), ((y1 - y0) as u32).max(1))
+    }
+
+    /// A find in crop pixels (origin at [`PpeCrop::pixels`]' corner) back in substream pixels.
+    pub fn map_back(&self, det: &Detection) -> Detection {
+        let (ox, oy, _, _) = self.pixels();
+        let (ox, oy) = (ox as f64, oy as f64);
+        let b = det.bbox;
+        Detection { cls: det.cls.clone(), conf: det.conf,
+                    bbox: [(ox + b[0]) / self.scale, (oy + b[1]) / self.scale, (ox + b[2]) / self.scale, (oy + b[3]) / self.scale] }
+    }
+}
+
+/// Where a PPE verdict came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PpeSource {
+    /// The camera watching the person, this frame.
+    Main,
+    /// The same camera's last clear look at the person.
+    #[serde(rename = "self")]
+    OwnHistory,
+    /// Another camera that saw the person (matched by floor position), e.g. at an entry.
+    Entry,
+}
+
+/// A PPE verdict after fusion, with where it came from and how many frames old it is.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct FusedPpe {
+    pub verdict: Ppe,
+    pub source: Option<PpeSource>,
+    pub age_frames: Option<i64>,
+}
+
+/// A remembered decided verdict: what, on which frame, from where.
+pub type PpeMemory = (Ppe, i64, PpeSource);
+
+/// The fusion rule (`proofs/Grammar.lean`: `fuse`): the current verdict stands; remembered
+/// evidence only fills an UNKNOWN, and only while at most `window` frames old.
+pub fn fuse_ppe(main: Ppe, mem: Option<PpeMemory>, frame: i64, window: i64) -> FusedPpe {
+    if main != Ppe::Unknown {
+        return FusedPpe { verdict: main, source: Some(PpeSource::Main), age_frames: Some(0) };
+    }
+    match mem {
+        Some((v, at, src)) if frame - at <= window => FusedPpe { verdict: v, source: Some(src), age_frames: Some(frame - at) },
+        _ => FusedPpe { verdict: Ppe::Unknown, source: None, age_frames: None },
+    }
+}
+
+/// Remembers each person's last decided helmet and vest verdicts, from their own camera and
+/// from other cameras on the same floor, to fill short UNKNOWN gaps (occlusion, a missed box).
+///
+/// In simulation, the camera's own last clear look within 2 s cut helmet UNKNOWN from 32 % to
+/// 1 % (MCC 0.953 to 0.942); an entry camera alone only to 23 %, and adding it to the own
+/// history gained nothing. Filled verdicts are the ones to audit: 2.4 % of filled "compliant"
+/// were people who had just taken the helmet off. Keep the window short.
+#[derive(Debug, Default)]
+pub struct PpeFusion {
+    /// Use the camera's own last clear look.
+    pub use_own: bool,
+    /// Use other cameras' verdicts.
+    pub use_entry: bool,
+    /// How far apart on the floor two cameras' people can be and still be the same person, metres.
+    pub assoc_m: f64,
+    mem: HashMap<u32, [Option<PpeMemory>; 2]>,
+}
+
+impl PpeFusion {
+    pub fn new(use_own: bool, use_entry: bool, assoc_m: f64) -> Self {
+        PpeFusion { use_own, use_entry, assoc_m, mem: HashMap::new() }
+    }
+
+    fn put(&mut self, track: u32, item: usize, v: Ppe, frame: i64, src: PpeSource) {
+        let slot = &mut self.mem.entry(track).or_default()[item];
+        if slot.is_none_or(|(_, at, _)| frame >= at) {
+            *slot = Some((v, frame, src));
+        }
+    }
+
+    /// Take one frame: this camera's people, and other cameras' people on the same frame.
+    pub fn observe(&mut self, frame: i64, main: &[WorkerReport], others: &[WorkerReport]) {
+        if self.use_own {
+            for w in main {
+                for (i, v) in [w.helmet, w.vest].into_iter().enumerate() {
+                    if v != Ppe::Unknown {
+                        self.put(w.track, i, v, frame, PpeSource::OwnHistory);
+                    }
+                }
+            }
+        }
+        if self.use_entry && !main.is_empty() {
+            for g in others {
+                let d = |w: &WorkerReport| ((w.floor_xy[0] - g.floor_xy[0]).powi(2) + (w.floor_xy[1] - g.floor_xy[1]).powi(2)).sqrt();
+                let k = (0..main.len()).fold(0, |b, i| if d(&main[i]) < d(&main[b]) { i } else { b });
+                if d(&main[k]) <= self.assoc_m {
+                    for (i, v) in [g.helmet, g.vest].into_iter().enumerate() {
+                        if v != Ppe::Unknown {
+                            self.put(main[k].track, i, v, frame, PpeSource::Entry);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A person's helmet and vest after fusion.
+    pub fn fused(&self, frame: i64, w: &WorkerReport, window: i64) -> [FusedPpe; 2] {
+        let mem = self.mem.get(&w.track).copied().unwrap_or_default();
+        [fuse_ppe(w.helmet, mem[0], frame, window), fuse_ppe(w.vest, mem[1], frame, window)]
+    }
+
+    /// Forget people no longer tracked.
+    pub fn retain(&mut self, live: impl Fn(u32) -> bool) {
+        self.mem.retain(|&t, _| live(t));
+    }
+}
+
+/// One crop worth labelling.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LabelCandidate {
+    pub frame: i64,
+    pub track: u32,
+    /// "helmet" or "vest".
+    pub item: &'static str,
+    /// The person's box on the substream; cut the main-stream crop with [`PpeCrop::for_person`].
+    pub person_box: [f64; 4],
+    pub p_violation: f32,
+    /// "ambiguous" (the conformal set held both labels) or "near_coin_flip".
+    pub reason: &'static str,
+}
+
+/// Picks the crops to label for fine-tuning on a site's own far-field footage: people in
+/// plain view whose PPE verdict was ambiguous or close to a coin flip, at most one crop per
+/// person and item every `gap` frames, and at most `per_hour` crops per hour.
+///
+/// In simulation a queued crop was about ten times likelier to be a model mistake than a
+/// random visible person (helmet 23 % against 2.3 %). Label them, add them to
+/// `notebooks/finetune_gray.ipynb`'s data, and hold out whole cameras, not frames.
+#[derive(Debug)]
+pub struct LabelQueue {
+    pub gap: i64,
+    pub margin: f32,
+    pub per_hour: usize,
+    pub fps: f64,
+    last: HashMap<(u32, usize), i64>,
+    taken: VecDeque<i64>,
+}
+
+impl LabelQueue {
+    pub fn new(gap: i64, margin: f32, per_hour: usize, fps: f64) -> Self {
+        LabelQueue { gap, margin, per_hour, fps, last: HashMap::new(), taken: VecDeque::new() }
+    }
+
+    /// This frame's candidates.
+    pub fn consider(&mut self, frame: i64, workers: &[WorkerReport]) -> Vec<LabelCandidate> {
+        let hour = (3600.0 * self.fps) as i64;
+        while self.taken.front().is_some_and(|&t| t <= frame - hour) {
+            self.taken.pop_front();
+        }
+        let mut out = Vec::new();
+        for w in workers {
+            let Some(bbox) = w.bbox else { continue };
+            if w.ppe_occluded {
+                continue;
+            }
+            for (i, (item, verdict)) in [("helmet", w.helmet), ("vest", w.vest)].into_iter().enumerate() {
+                let Some(p) = w.ppe_p_violation[i] else { continue };
+                let reason = if verdict == Ppe::Unknown { "ambiguous" } else if (p - 0.5).abs() < self.margin { "near_coin_flip" } else { continue };
+                if self.taken.len() >= self.per_hour || frame - self.last.get(&(w.track, i)).copied().unwrap_or(i64::MIN / 2) < self.gap {
+                    continue;
+                }
+                self.last.insert((w.track, i), frame);
+                self.taken.push_back(frame);
+                out.push(LabelCandidate { frame, track: w.track, item, person_box: bbox, p_violation: p, reason });
+            }
+        }
+        out
+    }
+}
+
 struct Track {
     id: u32,
     pos: [f64; 2],
@@ -327,6 +541,9 @@ struct Track {
     alarm: [bool; 2],
     hist: VecDeque<Seen>,
     ppe: [Ppe; 2],
+    ppe_p: [Option<f32>; 2],
+    occluded: bool,
+    last_box: [f64; 4],
 }
 
 struct Post {
@@ -354,6 +571,13 @@ pub struct WorkerReport {
     pub red_zone: Tri,
     pub helmet: Ppe,
     pub vest: Ppe,
+    /// The person's box on this frame's substream (None when only predicted): where to cut a
+    /// [`PpeCrop`] from the main stream.
+    pub bbox: Option<[f64; 4]>,
+    /// The PPE model's probability of a helmet / vest violation (None without PPE heads).
+    pub ppe_p_violation: [Option<f32>; 2],
+    /// Whether the PPE view was occluded or the person missed on this frame.
+    pub ppe_occluded: bool,
     /// The derivation of each alarm (Datalog backend only).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub proof: Vec<String>,
@@ -526,12 +750,12 @@ impl SafetyEngine {
             by.entry(d.cls.as_str()).or_default().push(d);
         }
         // people on the floor; a box cut off at the bottom has no trustworthy foot point
-        struct P { conf: f64, xy: [f64; 2], trunc: bool, h: f64, helmet: f64, vest: f64 }
+        struct P { conf: f64, xy: [f64; 2], trunc: bool, h: f64, helmet: f64, vest: f64, bbox: [f64; 4] }
         let people: Vec<P> = by.get("person").map_or(vec![], |ds| ds.iter().map(|d| {
             let [x1, y1, x2, y2] = d.bbox;
             let (h, w) = (y2 - y1, (x2 - x1).max(1e-3));
             let (helmet, vest) = Self::parts(&d.bbox, &by);
-            P { conf: d.conf, xy: self.calib.to_floor((x1 + x2) / 2.0, y2), trunc: h / w < 1.9, h, helmet, vest }
+            P { conf: d.conf, xy: self.calib.to_floor((x1 + x2) / 2.0, y2), trunc: h / w < 1.9, h, helmet, vest, bbox: d.bbox }
         }).collect());
         // two-stage matching on the floor, in metres
         for t in self.tracks.iter_mut() {
@@ -570,6 +794,7 @@ impl SafetyEngine {
             }
             tr.last = f;
             tr.hits += 1;
+            tr.last_box = p.bbox;
             push_seen(&mut tr.hist, Seen { detected: true, occluded: p.trunc || p.conf < 0.35, conf: p.conf, helmet: p.helmet, vest: p.vest, box_h: p.h },
                       self.grid.site.ppe_win);
         }
@@ -586,7 +811,7 @@ impl SafetyEngine {
                 let mut hist = VecDeque::new();
                 push_seen(&mut hist, Seen { detected: true, occluded: false, conf: p.conf, helmet: p.helmet, vest: p.vest, box_h: p.h }, self.grid.site.ppe_win);
                 self.tracks.push(Track { id: self.next_id, pos: p.xy, vel: [0.0; 2], pred: p.xy, last: f, hits: 1, s: [0; 2], alarm: [false; 2],
-                                         hist, ppe: [Ppe::Unknown; 2] });
+                                         hist, ppe: [Ppe::Unknown; 2], ppe_p: [None; 2], occluded: false, last_box: p.bbox });
             }
         }
         self.tracks.retain(|t| f - t.last <= 15);
@@ -646,11 +871,15 @@ impl SafetyEngine {
             }
             if let Some(heads) = &self.ppe {
                 let (feat, occ) = ppe_features(&tr.hist, win);
-                tr.ppe = [heads[0].decide(&feat, occ), heads[1].decide(&feat, occ)];
+                let (h, v) = (heads[0].decide_with_p(&feat, occ), heads[1].decide_with_p(&feat, occ));
+                tr.ppe = [h.0, v.0];
+                tr.ppe_p = [Some(h.1), Some(v.1)];
+                tr.occluded = occ;
             }
             let tri = |a: bool| if gated { Tri::Unknown } else { Tri::from(a) };
             out.push(WorkerReport { track: tr.id, floor_xy: tr.pos, cell: workers[k].1, line_of_fire: tri(tr.alarm[LOF]), red_zone: tri(tr.alarm[RED]),
-                                    helmet: tr.ppe[0], vest: tr.ppe[1], proof: std::mem::take(&mut proofs[k]) });
+                                    helmet: tr.ppe[0], vest: tr.ppe[1], bbox: (tr.last == f).then_some(tr.last_box),
+                                    ppe_p_violation: tr.ppe_p, ppe_occluded: tr.occluded, proof: std::mem::take(&mut proofs[k]) });
         }
         let gap = if opened == Some(true) { self.gap(&posts) } else { None };
         self.last_bar = bar;
@@ -675,6 +904,73 @@ fn push_seen(h: &mut VecDeque<Seen>, s: Seen, win: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn worker(track: u32, xy: [f64; 2], helmet: Ppe) -> WorkerReport {
+        WorkerReport { track, floor_xy: xy, cell: (0, 0), line_of_fire: Tri::No, red_zone: Tri::No, helmet, vest: Ppe::Unknown, bbox: None,
+                       ppe_p_violation: [None; 2], ppe_occluded: false, proof: vec![] }
+    }
+
+    #[test]
+    fn fusion_never_hides_a_current_verdict_and_expires() {
+        // mirror of fuse_keeps_violation / fuse_stale_is_unknown / fuse_compliant_has_witness
+        let ppe = [Ppe::Compliant, Ppe::Violation, Ppe::Unknown];
+        let src = PpeSource::Entry;
+        for &main in &ppe {
+            for &m in &ppe {
+                for at in [0i64, 5, 10] {
+                    let f = fuse_ppe(main, Some((m, at, src)), 10, 3);
+                    if main != Ppe::Unknown {
+                        assert_eq!(f.verdict, main);
+                    }
+                    if f.verdict == Ppe::Compliant {
+                        assert!(main == Ppe::Compliant || (main == Ppe::Unknown && m == Ppe::Compliant && 10 - at <= 3));
+                    }
+                    if main == Ppe::Unknown && 10 - at > 3 {
+                        assert_eq!(f.verdict, Ppe::Unknown);
+                    }
+                }
+            }
+        }
+        // an entry-camera verdict fills a gap for the person standing at the same place, not for another
+        let mut fu = PpeFusion::new(false, true, 0.8);
+        fu.observe(100, &[worker(7, [10.0, 6.0], Ppe::Unknown), worker(8, [14.0, 6.0], Ppe::Unknown)], &[worker(1, [10.3, 6.1], Ppe::Violation)]);
+        assert_eq!(fu.fused(110, &worker(7, [10.0, 6.0], Ppe::Unknown), 20)[0].verdict, Ppe::Violation);
+        assert_eq!(fu.fused(110, &worker(8, [14.0, 6.0], Ppe::Unknown), 20)[0].verdict, Ppe::Unknown);
+        assert_eq!(fu.fused(130, &worker(7, [10.0, 6.0], Ppe::Unknown), 20)[0].verdict, Ppe::Unknown);
+        assert_eq!(fu.fused(110, &worker(7, [10.0, 6.0], Ppe::Compliant), 20)[0].source, Some(PpeSource::Main));
+    }
+
+    #[test]
+    fn the_label_queue_takes_visible_doubtful_people_and_caps() {
+        let mut q = LabelQueue::new(20, 0.25, 3, 10.0);
+        let mut w = worker(1, [0.0, 0.0], Ppe::Unknown);
+        w.bbox = Some([10.0, 10.0, 20.0, 40.0]);
+        w.ppe_p_violation = [Some(0.48), Some(0.02)];
+        w.vest = Ppe::Compliant;
+        assert_eq!(q.consider(0, std::slice::from_ref(&w)).len(), 1); // helmet ambiguous; vest confidently fine
+        assert!(q.consider(5, std::slice::from_ref(&w)).is_empty()); // same person too soon
+        w.ppe_occluded = true;
+        assert!(q.consider(30, std::slice::from_ref(&w)).is_empty()); // occluded teaches nothing
+        w.ppe_occluded = false;
+        let mut others: Vec<WorkerReport> = (2..6).map(|t| WorkerReport { track: t, ..w.clone() }).collect();
+        others[0].ppe_p_violation = [Some(0.6), Some(0.02)];
+        others[0].helmet = Ppe::Violation; // decided, but near a coin flip
+        assert_eq!(q.consider(40, &others).len(), 2); // hourly cap of 3 reached
+    }
+
+    #[test]
+    fn a_ppe_crop_maps_back_onto_the_person() {
+        // a 20 x 50 px person on the substream, 4x main stream
+        let c = PpeCrop::for_person(&[100.0, 200.0, 120.0, 250.0], 4.0, 2560.0, 1920.0);
+        assert_eq!(c.rect, [380.0, 780.0, 500.0, 930.0]);
+        assert_eq!(c.pixels(), (380, 780, 120, 150));
+        // a helmet found at the top middle of the crop lands on the person's head band
+        let h = c.map_back(&Detection { cls: "helmet".into(), conf: 0.9, bbox: [44.0, 20.0, 76.0, 44.0] });
+        assert_eq!(h.bbox, [106.0, 200.0, 114.0, 206.0]);
+        // clamped at the frame's edge
+        let e = PpeCrop::for_person(&[0.0, 0.0, 20.0, 50.0], 4.0, 2560.0, 1920.0);
+        assert_eq!(e.rect[..2], [0.0, 0.0]);
+    }
 
     #[test]
     fn a_four_ray_never_crosses_an_eight_line() {

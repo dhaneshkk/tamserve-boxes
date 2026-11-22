@@ -311,26 +311,53 @@ What was learned building it, on a 2-core CPU with demo data:
 
 ## Safety rules on the floor
 
-`src/lens.rs`, `src/grammar.rs` and `src/datalog.rs` turn boxes into site verdicts, in metres: the Rust port of the `vg360_grammar` notebook, frame for frame (see Tests).
+A camera with `safety = "gate.safety.json"` in its config also runs safety rules on its objects, in metres on the floor. The code is `src/lens.rs`, `src/grammar.rs`, `src/datalog.rs` and `src/safety.rs`: the Rust port of `notebooks/vg360_grammar.ipynb`, frame for frame (see Tests). Its verdicts come out in three places:
+- the camera's report (`safety`), so they are on `/status` and `/v1/chat/completions`;
+- the metrics: `tamserve_safety_line_of_fire`, `_red_zone`, `_perimeter_breach`, `_calibration{state}` and `_ppe{item,verdict}`;
+- with `label_queue` set, a JSON-lines file of crops worth labelling.
 
-- **Lens first.** A point is undistorted with the camera's lens model, then mapped to the floor by a homography fitted to floor markings: `floor = H · G · undistort(u, v)`. On a 2.8 mm lens, skipping the undistortion put people 39 cm off on average and up to 1 m. Undistortion is Newton's method on OpenCV's model, to 1e-9 px. OpenCV 4's `undistortPoints` does not converge near the corners of a strong barrel lens. A fitted model that folds inside the picture is refused (`Lens::monotone`).
-- **Calibrate without a checkerboard.** The notebook fits the lens from straight floor lines (paint, grating edges, rails) or jointly with the clicked markers. Both came within a few centimetres of a checkerboard in simulation.
-- **The camera moving.** A drift check matches the current frame against a reference frame where OpenCV runs (ORB and RANSAC) and hands the result to `Calibration::apply_drift`. A measured move is corrected exactly for the floor (`G`). A view that cannot be confirmed (lens covered, steam, camera turned away) makes every floor rule UNKNOWN, never "clear". In simulation: a 3° knock without the check dropped red-zone MCC from 0.71 to 0.38; with it, it stayed at 0.75. A covered lens without the check gave 1,040 false barricade alarms in 2,025 frames; with it, none, and UNKNOWN after 5 frames.
-- **The rules.**
-  - Line of fire, unless a barrier lies on the 4-connected ray between person and forklift.
-  - Red zone.
-  - Barricade closure: posts that persist are chained, and a fill from the hazard tests whether the chain is closed.
-  - Helmet and vest, as a person's head and torso bands, judged by a small SAM-trained model with conformal thresholds. An occluded person is UNKNOWN, never compliant.
-- **No flicker.** Every alarm goes through a leaky bucket, so it takes `hi - lo` frames to go on or off.
-- **Proofs.** `Backend::Datalog` runs the same rules as Datalog clauses in yappu-fsm's schema, with a derivation for every alarm. For a breach, the derivation is the escape path through the gap, re-checked by `valid_path`. The native backend gives the same verdicts and is faster.
-- **Formal checks.** `proofs/Grammar.lean` covers the bucket, the PPE decision, the grid, the breach-path check and the calibration gate.
+**The spec** is a JSON file: site, calibration, PPE heads, rule backend, label map. The notebook writes one; `src/safety.rs` documents it. It is checked when the config loads: a lens model that folds, a fill box outside the grid, or `datalog` without clauses stops the start. Leave out `ppe` until the detector knows `helmet` and `vest`. With a stock COCO model nobody ever has a helmet box, so everyone in plain view would be a violation. Set `perimeter = false` on a camera with no barricade in view, or the closure test will always say "open".
+
+**From pixels to the floor.**
+- **Lens first.** A point is undistorted with the camera's lens model, then mapped to the floor by a homography fitted to floor markings: `floor = H · G · undistort(u, v)`.
+  - On a 2.8 mm lens, skipping the undistortion put people 39 cm off on average and up to 1 m.
+  - Undistortion is Newton's method on OpenCV's model, to 1e-9 px. OpenCV 4's `undistortPoints` does not converge near the corners of a strong barrel lens.
+  - A fitted model that folds inside the picture is refused (`Lens::monotone`).
+- **Calibrate without a checkerboard.** The notebook fits the lens from straight floor lines (paint, grating edges, rails): 5.4 cm average error in simulation. Or it fits the lens jointly with the clicked markers: 6.9 cm. Starting the fit from no distortion once gave a model that folds; the start now comes from a coarse grid, with folding models penalised.
+- **The camera moving.** A checker beside the box (OpenCV: ORB and RANSAC against a reference frame) posts what it finds to `POST /safety/<camera>/drift`.
+  - A measured move is corrected exactly for the floor (`G`).
+  - A view it cannot confirm (lens covered, steam, camera turned away) makes every floor rule UNKNOWN, never "clear", and raises `calibration-lost`.
+  - In simulation, a 3° knock without the check dropped red-zone MCC from 0.78 to 0.31; with it, red-zone MCC was 0.64. Line of fire went from 0.77 to 0.80 and the barricade from 0.80 to 0.88. The correction recovers most, not all: recalibrate after a knock.
+  - A covered lens without the check gave 1,046 false barricade alarms in 2,025 frames; with it, none, and UNKNOWN after 5 frames.
+
+**The rules.**
+- Line of fire, unless a barrier lies on the 4-connected ray between person and forklift.
+- Red zone.
+- Barricade closure: posts that persist are chained, and a fill from the hazard tests whether the chain is closed.
+- Helmet and vest, as a person's head and torso bands, judged by a small SAM-trained model with conformal thresholds. An occluded person is UNKNOWN, never compliant.
+- Every alarm goes through a leaky bucket, so it takes `hi - lo` frames to go on or off.
+- `Backend::Datalog` runs the same rules as Datalog clauses in yappu-fsm's schema, with a derivation for every alarm. For a breach, the derivation is the escape path through the gap, re-checked by `valid_path`. The native backend gives the same verdicts and is faster.
+
+**PPE needs pixels.** On the 640 px grey substream a far worker's head is a few pixels. In simulation helmet MCC was 0.58 there, against 0.95 on a 4x crop of the same person from the main stream (vest: 0.55 against 0.97). Each worker in the report carries its box. `PpeCrop` gives the main-stream rectangle to run the PPE detector on, and maps its finds back. Running that second look in the runner is not done yet.
+
+**Filling short gaps.** About a third of PPE verdicts stay UNKNOWN even on crops: the person is occluded or missed on that frame. The report's `ppe_fused` fills them from the camera's own last clear look, at most 20 frames old by default (`fusion.own_window_frames`), and says where each verdict came from and how old it is. In simulation, helmet UNKNOWN fell from 32 % to 1 %, and MCC from 0.953 to 0.942. Of the filled "compliant" verdicts, 2.4 % were people who had just taken the helmet off: keep the window short. An entry camera's verdicts can be fused too (`PpeFusion`, matched by floor position). In simulation it filled fewer gaps than the camera's own history, and adding it to the history gained nothing.
+
+**Label queue.** It picks the crops worth labelling: people in plain view whose PPE verdict was ambiguous or near a coin flip, one per person per few seconds, capped per hour. In simulation a queued crop was about ten times likelier to be a model mistake than a random visible person (helmet 23 % against 2.3 %). Label the crops, fine-tune with `notebooks/finetune_gray.ipynb`, and hold out whole cameras.
+
+**Formal checks.** `proofs/Grammar.lean` covers:
+- the bucket;
+- the PPE decision;
+- the grid;
+- the breach-path check;
+- the calibration gate;
+- the fusion rule: a current verdict is never hidden, and a filled "compliant" always has a fresh witness.
 
 ```text
 cargo run --release --example grammar_replay      # both backends on the golden episodes
 native   0.06 ms/frame    datalog 0.55 ms/frame (one 40 x 30 grid, 2-core sandbox CPU)
 ```
 
-The detector has to know the classes: `person`, `forklift`, `helmet`, `vest`, `barrier_post` (fine-tune with `notebooks/finetune_gray.ipynb`). The drift check needs OpenCV, which this crate does not use. Run it beside the box (Python), or port it.
+The detector has to know the classes: `person`, `forklift`, `helmet`, `vest`, `barrier_post` (fine-tune with `notebooks/finetune_gray.ipynb`, or map your labels with `labels` in the spec).
 
 ## CPU and memory
 
@@ -403,7 +430,14 @@ scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs m
   - retention: each kind of segment's days, the seconds before and after an event, segments past the log, the space order, pins, a sweep on disk, a bad pins file;
   - live fan-out: every viewer in order, a slow viewer dropped, the limits, a late viewer starting at the latest keyframe with the tables;
   - `tests/recording.rs`: one clip followed with the gate, recorded and watched at once (needs `x264enc` to make the clip).
+  - the safety spec in the config: found beside it, checked, refused with its mistakes; the drift route over a socket (token, unknown camera, bad JSON); `SafetyCam` from objects to verdicts, the label queue's file, a reconnect starting over, no barricade reported as unknown;
   - the safety rules (`tests/grammar.rs`): two simulated episodes replayed against the Python reference's every decision. One has a barricade breach and a camera knocked 3° part way (drift-corrected); in the other the lens is covered part way (floor rules UNKNOWN). Over 440 frames and 2,366 per-person results, both backends match exactly: alarms, PPE verdicts, posts, gaps and breach proofs, with floor positions within 1e-13 m. Undistortion is checked against the reference, and the grid against its cell map.
+- **The safety rules end to end, by hand**: `run` with the real model on OpenCV's `vtest.avi` (pedestrians), with the simulated site's spec.
+  - YOLOX's finds go into the Datalog engine.
+  - Verdicts reach `/status`, `/metrics` and `/v1/chat/completions`.
+  - A posted "lens covered" drift check turns every floor verdict UNKNOWN with `calibration-lost`; a confirmed one restores them; an unknown camera gets 404.
+  - The label queue writes its file.
+  - The verdicts themselves mean nothing there: that scene has no calibration, no PPE classes and no barricade.
 - **`scripts/rtsp_test.sh`**, against a real RTSP server that needs a password (all 10 checks pass):
   - four cameras up;
   - a wrong password reported and retried;
@@ -423,6 +457,7 @@ scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs m
 - VA-API decoding in the shared pipeline (as with VA-API at all: no Intel GPU here).
 - Recording many cameras' main streams to one disk at once, and the sweeper on a disk with months of segments.
 - Live view in a browser: mpegts.js is expected to play `/live/<camera>.ts`, but that hasn't been tried.
+- The PPE crop on the main stream inside the runner (`PpeCrop` exists, the second look does not), and an entry camera's fusion across boxes.
 - The safety rules on real footage. Everything above is a simulated site with a known camera: lens, drift and rules need tuning and MCC checks on each real site (`gate_mcc`-style) before anyone relies on them. Feature matching for the drift check has not been tried on repetitive deck grating, which may confuse it.
 - `deploy/setup-zram.sh` on real Ubuntu. It passes shellcheck, but the machine this was built on has no zram module. Run `--check` before and after on the target box.
 

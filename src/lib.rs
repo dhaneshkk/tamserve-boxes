@@ -53,6 +53,7 @@ pub mod retention;
 pub mod onvif;
 #[cfg(feature = "cameras")]
 pub mod runner;
+pub mod safety;
 mod tracker;
 
 pub use detector::{Detector, DetectorOptions};
