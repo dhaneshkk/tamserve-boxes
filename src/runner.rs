@@ -79,6 +79,8 @@ pub struct Shared {
     pub recordings: Mutex<Recordings>,
     /// Drift checks posted to `POST /safety/<camera>/drift`, waiting for the camera's next step.
     pub drift: Mutex<HashMap<String, DriftEstimate>>,
+    /// Cameras asked to take a drift reference (`POST /safety/<camera>/reference`).
+    pub reference: Mutex<std::collections::HashSet<String>>,
 }
 
 /// The sweeper's counts, for the metrics.
@@ -231,7 +233,7 @@ impl Runner {
                 View { label: c.label(), health: s.health.clone(), latest: None, motion: Vec::new(), live: s.live.clone(),
                        safety: safety.is_some() });
             if let Some(spec) = safety {
-                self.safety.insert(c.name.clone(), SafetyCam::new(spec));
+                self.safety.insert(c.name.clone(), SafetyCam::new(spec)?);
             }
             if let Some(m) = &mut self.motion {
                 m.masks.insert(c.name.clone(), c.motion_mask.clone());
@@ -353,8 +355,17 @@ impl Runner {
                 // Settling: nothing was looked at, so the rules keep their last verdicts.
                 Some(_) if light.settling => views.get(name).and_then(|v| v.latest.as_ref()).and_then(|r| r.safety.clone()),
                 Some(sc) => {
-                    let drift = sh.drift.lock().unwrap().remove(name);
-                    let dets = sc.detections(objects.iter().map(|o| (o.label.as_str(), o.score, o.bbox)));
+                    if sh.reference.lock().unwrap().remove(name) {
+                        sc.request_reference();
+                    }
+                    let boxes: Vec<[f64; 4]> = objects.iter().map(|o| o.bbox.map(|v| v as f64)).collect();
+                    let own = sc.drift_step(&f.pixels, f.width, f.height, light.mode.as_str(), &boxes);
+                    let drift = sh.drift.lock().unwrap().remove(name).or(own);
+                    let mut dets = sc.detections(objects.iter().map(|o| (o.label.as_str(), o.score, o.bbox)));
+                    let ids: Vec<u32> = objects.iter().map(|o| o.id).collect();
+                    if let Err(e) = sc.look_ppe(&f.pixels, f.width, f.height, &ids, &mut dets) {
+                        eprintln!("tamserve-boxes: camera {name}: the PPE look failed: {e}");
+                    }
                     Some(sc.process(name, &dets, drift.as_ref()))
                 }
                 None => None,
@@ -476,6 +487,16 @@ impl crate::http::Source for Shared {
                     let _ = writeln!(m, "tamserve_safety_calibration{{camera=\"{}\",state=\"{name}\"}} {}", label(cam), u8::from(s.report.calibration == st));
                 }
             }
+            let _ = writeln!(m, "# HELP tamserve_safety_drift_px how far the camera's view has moved since calibration, at the last check\n# TYPE tamserve_safety_drift_px gauge");
+            for (cam, s) in &safe {
+                if let Some(d) = s.drift_last.as_ref().and_then(|d| d.drift_px) {
+                    let _ = writeln!(m, "tamserve_safety_drift_px{{camera=\"{}\"}} {d}", label(cam));
+                }
+            }
+            let _ = writeln!(m, "# HELP tamserve_safety_ppe_looks_total people looked at again for PPE on full-resolution crops\n# TYPE tamserve_safety_ppe_looks_total counter");
+            for (cam, s) in &safe {
+                let _ = writeln!(m, "tamserve_safety_ppe_looks_total{{camera=\"{}\"}} {}", label(cam), s.ppe_looks_total);
+            }
             let _ = writeln!(m, "# HELP tamserve_safety_ppe people by helmet and vest verdict, after filling short gaps\n# TYPE tamserve_safety_ppe gauge");
             for (cam, s) in &safe {
                 for (item, pick) in [("helmet", 0usize), ("vest", 1)] {
@@ -513,6 +534,14 @@ impl crate::http::Source for Shared {
             return false;
         }
         self.drift.lock().unwrap().insert(camera.to_string(), est);
+        true
+    }
+
+    fn reference(&self, camera: &str) -> bool {
+        if !self.cameras.lock().unwrap().get(camera).is_some_and(|v| v.safety) {
+            return false;
+        }
+        self.reference.lock().unwrap().insert(camera.to_string());
         true
     }
 

@@ -8,6 +8,8 @@
 //!
 //! - `GET /live/<camera>.ts`: a camera with `live = true`, as MPEG-TS, from the box's own
 //!   connection to it (see `restream`). At most 8 live viewers per box.
+//! - `POST /safety/<camera>/reference`: take the camera's next frame as its drift reference
+//!   for the current light mode (the view must be the calibrated one).
 //! - `POST /safety/<camera>/drift`: a drift check's result (`crate::lens::DriftEstimate`
 //!   as JSON) for a camera with safety rules, from a checker that runs OpenCV beside the
 //!   box. Applied on the camera's next step: corrected, or every floor rule UNKNOWN.
@@ -34,6 +36,10 @@ pub trait Source: Send + Sync + 'static {
     /// A camera's live stream, if it has one.
     /// A drift check's result for a camera's safety rules; false when the camera has none.
     fn drift(&self, _camera: &str, _est: crate::lens::DriftEstimate) -> bool {
+        false
+    }
+    /// Take the camera's next frame as its drift reference; false when it has no safety rules.
+    fn reference(&self, _camera: &str) -> bool {
         false
     }
     fn live(&self, _camera: &str) -> std::result::Result<Receiver<crate::restream::Chunk>, LiveRefused> {
@@ -144,6 +150,12 @@ fn handle(stream: TcpStream, token: Option<&str>, src: &dyn Source, busy: &Atomi
             }
         };
     }
+    if let (true, Some(cam)) = (method == "POST", route.strip_prefix("/safety/").and_then(|c| c.strip_suffix("/reference"))) {
+        return match src.reference(cam) {
+            true => reply(&stream, 200, "application/json", r#"{"ok":true}"#),
+            false => reply(&stream, 404, "application/json", &json!({"error": {"message": format!("no camera {cam:?} with safety rules")}}).to_string()),
+        };
+    }
     if let (true, Some(cam)) = (method == "POST", route.strip_prefix("/safety/").and_then(|c| c.strip_suffix("/drift"))) {
         return match serde_json::from_slice::<crate::lens::DriftEstimate>(&body) {
             Err(e) => reply(&stream, 400, "application/json", &json!({"error": {"message": e.to_string()}}).to_string()),
@@ -218,6 +230,9 @@ mod tests {
         fn status(&self) -> Value {
             json!({"cameras": {}})
         }
+        fn reference(&self, camera: &str) -> bool {
+            camera == "gate"
+        }
         fn drift(&self, camera: &str, est: crate::lens::DriftEstimate) -> bool {
             if camera != "gate" {
                 return false;
@@ -245,6 +260,9 @@ mod tests {
         assert!(post(addr, "/safety/gate/drift", est, Some("t0k")).starts_with("HTTP/1.1 200"));
         assert!(post(addr, "/safety/yard/drift", est, Some("t0k")).starts_with("HTTP/1.1 404"));
         assert!(post(addr, "/safety/gate/drift", "{not json", Some("t0k")).starts_with("HTTP/1.1 400"));
+        assert!(post(addr, "/safety/gate/reference", "", Some("t0k")).starts_with("HTTP/1.1 200"));
+        assert!(post(addr, "/safety/yard/reference", "", Some("t0k")).starts_with("HTTP/1.1 404"));
+        assert!(post(addr, "/safety/gate/reference", "", None).starts_with("HTTP/1.1 401"));
         let got = fake.got.lock().unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!((got[0].1.valid, got[0].1.drift_px, got[0].1.inliers), (true, Some(4.2), 800));

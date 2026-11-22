@@ -311,9 +311,9 @@ What was learned building it, on a 2-core CPU with demo data:
 
 ## Safety rules on the floor
 
-A camera with `safety = "gate.safety.json"` in its config also runs safety rules on its objects, in metres on the floor. The code is `src/lens.rs`, `src/grammar.rs`, `src/datalog.rs` and `src/safety.rs`: the Rust port of `notebooks/vg360_grammar.ipynb`, frame for frame (see Tests). Its verdicts come out in three places:
+A camera with `safety = "gate.safety.json"` in its config also runs safety rules on its objects, in metres on the floor. The code is `src/lens.rs`, `src/drift.rs`, `src/grammar.rs`, `src/datalog.rs` and `src/safety.rs`: the Rust port of `notebooks/vg360_grammar.ipynb`, frame for frame (see Tests). Its verdicts come out in three places:
 - the camera's report (`safety`), so they are on `/status` and `/v1/chat/completions`;
-- the metrics: `tamserve_safety_line_of_fire`, `_red_zone`, `_perimeter_breach`, `_calibration{state}` and `_ppe{item,verdict}`;
+- the metrics: `tamserve_safety_line_of_fire`, `_red_zone`, `_perimeter_breach`, `_calibration{state}`, `_drift_px`, `_ppe{item,verdict}` and `_ppe_looks_total`;
 - with `label_queue` set, a JSON-lines file of crops worth labelling.
 
 **The spec** is a JSON file: site, calibration, PPE heads, rule backend, label map. The notebook writes one; `src/safety.rs` documents it. It is checked when the config loads: a lens model that folds, a fill box outside the grid, or `datalog` without clauses stops the start. Leave out `ppe` until the detector knows `helmet` and `vest`. With a stock COCO model nobody ever has a helmet box, so everyone in plain view would be a violation. Set `perimeter = false` on a camera with no barricade in view, or the closure test will always say "open".
@@ -324,11 +324,17 @@ A camera with `safety = "gate.safety.json"` in its config also runs safety rules
   - Undistortion is Newton's method on OpenCV's model, to 1e-9 px. OpenCV 4's `undistortPoints` does not converge near the corners of a strong barrel lens.
   - A fitted model that folds inside the picture is refused (`Lens::monotone`).
 - **Calibrate without a checkerboard.** The notebook fits the lens from straight floor lines (paint, grating edges, rails): 5.4 cm average error in simulation. Or it fits the lens jointly with the clicked markers: 6.9 cm. Starting the fit from no distortion once gave a model that folds; the start now comes from a coarse grid, with folding models penalised.
-- **The camera moving.** A checker beside the box (OpenCV: ORB and RANSAC against a reference frame) posts what it finds to `POST /safety/<camera>/drift`.
-  - A measured move is corrected exactly for the floor (`G`).
-  - A view it cannot confirm (lens covered, steam, camera turned away) makes every floor rule UNKNOWN, never "clear", and raises `calibration-lost`.
-  - In simulation, a 3° knock without the check dropped red-zone MCC from 0.78 to 0.31; with it, red-zone MCC was 0.64. Line of fire went from 0.77 to 0.80 and the barricade from 0.80 to 0.88. The correction recovers most, not all: recalibrate after a knock.
-  - A covered lens without the check gave 1,046 false barricade alarms in 2,025 frames; with it, none, and UNKNOWN after 5 frames.
+- **Has the camera moved?** With a `drift` section in the spec, the box checks this itself every `every_frames` frames (`src/drift.rs`, no OpenCV).
+  - **How it checks.** The frame is reduced to about 320 px and undistorted. A homography to a reference frame is fitted by maximising their correlation (ECC, as OpenCV's `findTransformECC`), coarse to fine, from the best whole-pixel shift. Tracked people and forklifts are masked out.
+  - **References.** One per light mode, since an IR night picture does not look like the day one. Take each with `POST /safety/<camera>/reference` while the view is the calibrated one, or let `auto_reference` take them. They are kept in `reference_dir` and reloaded when the box starts.
+  - **When the camera has moved.** A measured move is corrected exactly for the floor (`G`).
+  - **When the view cannot be confirmed** (lens covered, steam, camera turned away), every floor rule is UNKNOWN, never "clear", and `calibration-lost` is raised.
+  - **The contrast check.** "Not confirmed" also needs a contrast test, not only correlation: a nearly covered lens keeps a faint copy of the scene that still correlates at 0.93 to 0.98. It must keep a quarter of the reference's contrast.
+  - **On the notebook's test frames** (`tests/drift.rs`), knocks of 1° to 8° in tilt and pan, including re-lit (IR-like) frames, are corrected from up to 2.2 m of floor error back to the calibration's own 5 cm, within 0.3 cm of OpenCV's ECC on the same frames. Steam, a covered lens and a 30° turn are refused. A check takes about 30 ms, or 100 ms when it fails.
+  - **On `vtest.avi`** (a fixed camera, a crowd walking through), it measured under 0.1 px of drift, at correlations between 0.95 and 0.997. A crowded scene pulls the correlation toward `rho_min` (0.9): watch `tamserve_safety_drift_px` and the correlation on a real site before trusting the threshold.
+  - **An outside checker** can still post to `POST /safety/<camera>/drift`; a posted result wins for that frame.
+  - **In simulation:** a 3° knock without the check dropped red-zone MCC from 0.78 to 0.31; with it, red-zone MCC was 0.64. Line of fire went from 0.77 to 0.80 and the barricade from 0.80 to 0.88. The correction recovers most, not all: recalibrate after a knock.
+  - **A covered lens without the check** gave 1,046 false barricade alarms in 2,025 frames; with it, none, and UNKNOWN after 5 frames.
 
 **The rules.**
 - Line of fire, unless a barrier lies on the 4-connected ray between person and forklift.
@@ -338,7 +344,14 @@ A camera with `safety = "gate.safety.json"` in its config also runs safety rules
 - Every alarm goes through a leaky bucket, so it takes `hi - lo` frames to go on or off.
 - `Backend::Datalog` runs the same rules as Datalog clauses in yappu-fsm's schema, with a derivation for every alarm. For a breach, the derivation is the escape path through the gap, re-checked by `valid_path`. The native backend gives the same verdicts and is faster.
 
-**PPE needs pixels.** On the 640 px grey substream a far worker's head is a few pixels. In simulation helmet MCC was 0.58 there, against 0.95 on a 4x crop of the same person from the main stream (vest: 0.55 against 0.97). Each worker in the report carries its box. `PpeCrop` gives the main-stream rectangle to run the PPE detector on, and maps its finds back. Running that second look in the runner is not done yet.
+**PPE needs pixels.** On the 640 px grey substream a far worker's head is a few pixels. In simulation helmet MCC was 0.58 there, against 0.95 on a 4x crop of the same person from the main stream (vest: 0.55 against 0.97). So a camera on its main stream can take a second look (`ppe_look` in the spec):
+- Each step, up to `most` people's head-and-torso crops are cut from the frame at full resolution. They are views into the frame, not copies, and go through a PPE model in one batch. The main detector sees the whole frame shrunk to 416 px.
+- People never looked at go first, then whoever was looked at longest ago, smaller ones first.
+- For a person looked at, the PPE model's finds replace the main detector's helmet and vest finds there; everyone else keeps the main detector's.
+- Each look costs one inference per person; `tamserve_safety_ppe_looks_total` counts them.
+- On a 640 px substream a crop has no more pixels than the frame, so leave it out there.
+
+`tests/model.rs` checks the look with YOLOX-Nano standing in for a PPE model: its find in a crop lands back on the object in the whole frame (IoU above 0.5), and replaces the main detector's.
 
 **Filling short gaps.** About a third of PPE verdicts stay UNKNOWN even on crops: the person is occluded or missed on that frame. The report's `ppe_fused` fills them from the camera's own last clear look, at most 20 frames old by default (`fusion.own_window_frames`), and says where each verdict came from and how old it is. In simulation, helmet UNKNOWN fell from 32 % to 1 %, and MCC from 0.953 to 0.942. Of the filled "compliant" verdicts, 2.4 % were people who had just taken the helmet off: keep the window short. An entry camera's verdicts can be fused too (`PpeFusion`, matched by floor position). In simulation it filled fewer gaps than the camera's own history, and adding it to the history gained nothing.
 
@@ -431,11 +444,15 @@ scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs m
   - live fan-out: every viewer in order, a slow viewer dropped, the limits, a late viewer starting at the latest keyframe with the tables;
   - `tests/recording.rs`: one clip followed with the gate, recorded and watched at once (needs `x264enc` to make the clip).
   - the safety spec in the config: found beside it, checked, refused with its mistakes; the drift route over a socket (token, unknown camera, bad JSON); `SafetyCam` from objects to verdicts, the label queue's file, a reconnect starting over, no barricade reported as unknown;
+  - the drift check (`tests/drift.rs`): the notebook's frames with known corrections. Knocks are corrected to within 0.3 cm of OpenCV's ECC; steam, a covered lens and a 30° turn are refused; a saved reference loads back the same. A `SafetyCam` takes a reference when asked, corrects a knock, goes UNKNOWN when blind, and finds its reference again after a restart;
+  - the PPE look (`tests/model.rs`, with the model): a crop's find maps back onto the object in the whole frame and replaces the main detector's;
   - the safety rules (`tests/grammar.rs`): two simulated episodes replayed against the Python reference's every decision. One has a barricade breach and a camera knocked 3° part way (drift-corrected); in the other the lens is covered part way (floor rules UNKNOWN). Over 440 frames and 2,366 per-person results, both backends match exactly: alarms, PPE verdicts, posts, gaps and breach proofs, with floor positions within 1e-13 m. Undistortion is checked against the reference, and the grid against its cell map.
 - **The safety rules end to end, by hand**: `run` with the real model on OpenCV's `vtest.avi` (pedestrians), with the simulated site's spec.
   - YOLOX's finds go into the Datalog engine.
   - Verdicts reach `/status`, `/metrics` and `/v1/chat/completions`.
   - A posted "lens covered" drift check turns every floor verdict UNKNOWN with `calibration-lost`; a confirmed one restores them; an unknown camera gets 404.
+  - The box's own drift check took its references by itself and checked every 10 frames (under 0.1 px measured on a fixed camera). `POST /safety/<camera>/reference` took a new one.
+  - The PPE look cut 3 crops a step from the frame and ran them through the model (YOLOX-Nano standing in).
   - The label queue writes its file.
   - The verdicts themselves mean nothing there: that scene has no calibration, no PPE classes and no barricade.
 - **`scripts/rtsp_test.sh`**, against a real RTSP server that needs a password (all 10 checks pass):
@@ -457,7 +474,8 @@ scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs m
 - VA-API decoding in the shared pipeline (as with VA-API at all: no Intel GPU here).
 - Recording many cameras' main streams to one disk at once, and the sweeper on a disk with months of segments.
 - Live view in a browser: mpegts.js is expected to play `/live/<camera>.ts`, but that hasn't been tried.
-- The PPE crop on the main stream inside the runner (`PpeCrop` exists, the second look does not), and an entry camera's fusion across boxes.
+- The PPE look with a real PPE model (none trained yet), and an entry camera's fusion across boxes.
+- The drift check on a camera that really moves, on IR night pictures, and on repetitive deck grating, which may give ECC more than one plausible fit.
 - The safety rules on real footage. Everything above is a simulated site with a known camera: lens, drift and rules need tuning and MCC checks on each real site (`gate_mcc`-style) before anyone relies on them. Feature matching for the drift check has not been tried on repetitive deck grating, which may confuse it.
 - `deploy/setup-zram.sh` on real Ubuntu. It passes shellcheck, but the machine this was built on has no zram module. Run `--check` before and after on the target box.
 

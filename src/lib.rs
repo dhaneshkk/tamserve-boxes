@@ -37,6 +37,7 @@ pub mod config;
 pub mod coord;
 pub mod datalog;
 mod detector;
+pub mod drift;
 #[cfg(feature = "fold")]
 pub mod fold;
 pub mod grammar;
