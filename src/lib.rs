@@ -35,12 +35,15 @@
 pub mod camera;
 pub mod config;
 pub mod coord;
+pub mod datalog;
 mod detector;
 #[cfg(feature = "fold")]
 pub mod fold;
+pub mod grammar;
 pub mod http;
 pub mod image;
 mod kalman;
+pub mod lens;
 pub mod light;
 pub mod motion;
 pub mod regions;

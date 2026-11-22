@@ -309,6 +309,29 @@ What was learned building it, on a 2-core CPU with demo data:
 - **Keep every class your labels mark.** Dropping labels turns those objects into "background" the model must unlearn, which cost the classes that were kept.
 - **The demo shows the pipeline, not a gain.** Left with no data, it downloads coco128 (GPL-3.0 as Ultralytics packages it), makes it CCTV-like, and scores people. But those pictures are in COCO's training set, which the released model already learned from. There, fine-tuning held MCC level (0.553 → 0.553) and the gate passed as "no worse"; earlier settings that made it worse were refused. A real gain needs your own footage, and enough held-out frames for the bootstrap interval to be narrow: a few hundred per camera type, held out by camera rather than by frame.
 
+## Safety rules on the floor
+
+`src/lens.rs`, `src/grammar.rs` and `src/datalog.rs` turn boxes into site verdicts, in metres: the Rust port of the `vg360_grammar` notebook, frame for frame (see Tests).
+
+- **Lens first.** A point is undistorted with the camera's lens model, then mapped to the floor by a homography fitted to floor markings: `floor = H · G · undistort(u, v)`. On a 2.8 mm lens, skipping the undistortion put people 39 cm off on average and up to 1 m. Undistortion is Newton's method on OpenCV's model, to 1e-9 px. OpenCV 4's `undistortPoints` does not converge near the corners of a strong barrel lens. A fitted model that folds inside the picture is refused (`Lens::monotone`).
+- **Calibrate without a checkerboard.** The notebook fits the lens from straight floor lines (paint, grating edges, rails) or jointly with the clicked markers. Both came within a few centimetres of a checkerboard in simulation.
+- **The camera moving.** A drift check matches the current frame against a reference frame where OpenCV runs (ORB and RANSAC) and hands the result to `Calibration::apply_drift`. A measured move is corrected exactly for the floor (`G`). A view that cannot be confirmed (lens covered, steam, camera turned away) makes every floor rule UNKNOWN, never "clear". In simulation: a 3° knock without the check dropped red-zone MCC from 0.71 to 0.38; with it, it stayed at 0.75. A covered lens without the check gave 1,040 false barricade alarms in 2,025 frames; with it, none, and UNKNOWN after 5 frames.
+- **The rules.**
+  - Line of fire, unless a barrier lies on the 4-connected ray between person and forklift.
+  - Red zone.
+  - Barricade closure: posts that persist are chained, and a fill from the hazard tests whether the chain is closed.
+  - Helmet and vest, as a person's head and torso bands, judged by a small SAM-trained model with conformal thresholds. An occluded person is UNKNOWN, never compliant.
+- **No flicker.** Every alarm goes through a leaky bucket, so it takes `hi - lo` frames to go on or off.
+- **Proofs.** `Backend::Datalog` runs the same rules as Datalog clauses in yappu-fsm's schema, with a derivation for every alarm. For a breach, the derivation is the escape path through the gap, re-checked by `valid_path`. The native backend gives the same verdicts and is faster.
+- **Formal checks.** `proofs/Grammar.lean` covers the bucket, the PPE decision, the grid, the breach-path check and the calibration gate.
+
+```text
+cargo run --release --example grammar_replay      # both backends on the golden episodes
+native   0.06 ms/frame    datalog 0.55 ms/frame (one 40 x 30 grid, 2-core sandbox CPU)
+```
+
+The detector has to know the classes: `person`, `forklift`, `helmet`, `vest`, `barrier_post` (fine-tune with `notebooks/finetune_gray.ipynb`). The drift check needs OpenCV, which this crate does not use. Run it beside the box (Python), or port it.
+
 ## CPU and memory
 
 `tamserve-boxes bench` runs N synthetic 720p cameras at a set frame rate in this one process, or with `--separate`, one process per camera. Measured on a 2-core cloud VM (Intel Xeon, OpenVINO 2026.4, float32, `look_every=3`), **not an N100**. Decoding is left out, and both benchmarks hold about 27 MB of frames per camera, which is included below.
@@ -380,6 +403,7 @@ scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs m
   - retention: each kind of segment's days, the seconds before and after an event, segments past the log, the space order, pins, a sweep on disk, a bad pins file;
   - live fan-out: every viewer in order, a slow viewer dropped, the limits, a late viewer starting at the latest keyframe with the tables;
   - `tests/recording.rs`: one clip followed with the gate, recorded and watched at once (needs `x264enc` to make the clip).
+  - the safety rules (`tests/grammar.rs`): two simulated episodes replayed against the Python reference's every decision. One has a barricade breach and a camera knocked 3° part way (drift-corrected); in the other the lens is covered part way (floor rules UNKNOWN). Over 440 frames and 2,366 per-person results, both backends match exactly: alarms, PPE verdicts, posts, gaps and breach proofs, with floor positions within 1e-13 m. Undistortion is checked against the reference, and the grid against its cell map.
 - **`scripts/rtsp_test.sh`**, against a real RTSP server that needs a password (all 10 checks pass):
   - four cameras up;
   - a wrong password reported and retried;
@@ -399,6 +423,7 @@ scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs m
 - VA-API decoding in the shared pipeline (as with VA-API at all: no Intel GPU here).
 - Recording many cameras' main streams to one disk at once, and the sweeper on a disk with months of segments.
 - Live view in a browser: mpegts.js is expected to play `/live/<camera>.ts`, but that hasn't been tried.
+- The safety rules on real footage. Everything above is a simulated site with a known camera: lens, drift and rules need tuning and MCC checks on each real site (`gate_mcc`-style) before anyone relies on them. Feature matching for the drift check has not been tried on repetitive deck grating, which may confuse it.
 - `deploy/setup-zram.sh` on real Ubuntu. It passes shellcheck, but the machine this was built on has no zram module. Run `--check` before and after on the target box.
 
 ## Licences
