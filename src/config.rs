@@ -29,6 +29,7 @@
 //! record = true                                   # write segments to [record] dir
 //! live = true                                     # GET /live/gate.ts
 //! safety = "gate.safety.json"                     # line of fire, red zone, barricade, PPE (see `safety`)
+//! iogp = "gate.iogp.json"                         # IOGP Life-Saving Rule alerts from iogp-editor's rules (see `iogp`)
 //!
 //! [motion]             # look only where something moves (see `motion`)
 //! hold = 10            # frames a camera stays awake after motion
@@ -262,6 +263,9 @@ pub struct CameraSection {
     /// Safety rules for this camera: a JSON spec (site, calibration, PPE heads), see
     /// [`crate::safety`]. Checked when the config loads.
     pub safety: Option<PathBuf>,
+    /// IOGP Life-Saving Rule alerts for this camera: a JSON spec naming iogp-editor's rules and a
+    /// vg360-scenegraph site file, see [`crate::iogp`]. Checked when the config loads.
+    pub iogp: Option<PathBuf>,
 }
 
 /// Motion found before detecting, so that cameras where nothing moves cost no looks.
@@ -404,6 +408,7 @@ pub struct Camera {
     pub encode: bool,
     pub motion_mask: Vec<[f32; 4]>,
     pub safety: Option<PathBuf>,
+    pub iogp: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Camera {
@@ -551,9 +556,15 @@ impl Config {
             cams.push(Camera { name: c.name.clone(), url, onvif, user: c.user.clone(), password,
                                look_every: c.look_every, weight: c.weight.unwrap_or(1.0), record, live: c.live,
                                encode: c.encode, motion_mask: c.motion_mask.clone(),
-                               safety: c.safety.as_ref().map(|p| if p.is_relative() { base.join(p) } else { p.clone() }) });
-            if let Some(p) = &cams.last().and_then(|c| c.safety.clone()) {
-                crate::safety::SafetySpec::load(p).map_err(|e| Error::Invalid(format!("camera {:?}: {e}", c.name)))?;
+                               safety: c.safety.as_ref().map(|p| if p.is_relative() { base.join(p) } else { p.clone() }),
+                               iogp: c.iogp.as_ref().map(|p| if p.is_relative() { base.join(p) } else { p.clone() }) });
+            let safety = match cams.last().and_then(|c| c.safety.clone()) {
+                Some(p) => Some(crate::safety::SafetySpec::load(&p).map_err(|e| Error::Invalid(format!("camera {:?}: {e}", c.name)))?),
+                None => None,
+            };
+            if let Some(p) = &cams.last().and_then(|c| c.iogp.clone()) {
+                crate::iogp::IogpSpec::load(p, &c.name, safety.as_ref().map(|s| &s.calib))
+                    .map_err(|e| Error::Invalid(format!("camera {:?}: {e}", c.name)))?;
             }
             crate::motion::MotionOptions { mask: c.motion_mask.clone(), ..Default::default() }.check()
                 .map_err(|e| Error::Invalid(format!("camera {:?}: {e}", c.name)))?;
@@ -737,6 +748,28 @@ mod tests {
         let e = Config::load(&cfg).unwrap_err().to_string();
         assert!(e.contains("gate") && e.contains("backend"), "{e}");
         let cfg = write(&d, "m.toml", &format!("{HEAD}[[camera]]\nname=\"gate\"\nurl=\"rtsp://h/1\"\nsafety=\"missing.json\"\n"), 0o644);
+        assert!(Config::load(&cfg).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_iogp_spec_is_found_beside_the_config_and_checked() {
+        let d = dir();
+        let golden = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/vg360_grammar_golden.json")).unwrap();
+        write(&d, "gate.safety.json", &golden, 0o644);
+        std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/vg360-scenegraph/tests/fixtures/config.json"), d.join("rules.json")).unwrap();
+        write(&d, "site.json", r#"{"cameras": [{"name": "gate", "decks": [{"id": "floor", "image_polygon": [[0,0],[640,0],[640,480],[0,480]]}]}]}"#, 0o644);
+        write(&d, "gate.iogp.json", r#"{"rules": "rules.json", "site": "site.json"}"#, 0o644);
+        let cam = "[[camera]]\nname=\"gate\"\nurl=\"rtsp://h/1\"\n";
+        // the deck has no homography: it takes the safety calibration's
+        let cfg = write(&d, "c.toml", &format!("{HEAD}{cam}safety=\"gate.safety.json\"\niogp=\"gate.iogp.json\"\n"), 0o644);
+        let (_, cams) = Config::load(&cfg).unwrap();
+        assert_eq!(cams[0].iogp.as_deref(), Some(d.join("gate.iogp.json").as_path()));
+        // without safety there is no H to take
+        let cfg = write(&d, "n.toml", &format!("{HEAD}{cam}iogp=\"gate.iogp.json\"\n"), 0o644);
+        let e = Config::load(&cfg).unwrap_err().to_string();
+        assert!(e.contains("gate") && e.contains("homography"), "{e}");
+        let cfg = write(&d, "m.toml", &format!("{HEAD}{cam}iogp=\"missing.json\"\n"), 0o644);
         assert!(Config::load(&cfg).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }

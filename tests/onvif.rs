@@ -312,7 +312,7 @@ fn a_camera_source_opens_the_stream_onvif_reports() {
             // A file has no host to swap for the device's.
             section: OnvifSection { use_device_host: Some(false), ..Default::default() },
         }),
-        record: false, live: false, encode: false, motion_mask: Vec::new(), safety: None,
+        record: false, live: false, encode: false, motion_mask: Vec::new(), safety: None, iogp: None,
     };
     let bell = std::sync::Arc::new(Bell::default());
     let source = camera::Source::open(camera, &Opening::from(&DecodeSection::default()), bell).unwrap();

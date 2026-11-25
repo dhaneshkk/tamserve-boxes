@@ -372,6 +372,51 @@ native   0.06 ms/frame    datalog 0.55 ms/frame (one 40 x 30 grid, 2-core sandbo
 
 The detector has to know the classes: `person`, `forklift`, `helmet`, `vest`, `barrier_post` (fine-tune with `notebooks/finetune_gray.ipynb`, or map your labels with `labels` in the spec).
 
+## IOGP Life-Saving Rule alerts
+
+A camera with `iogp = "gate.iogp.json"` in its config also runs the IOGP alert rules written and approved in iogp-editor (`dhaneshkk/test1_logpeditor`). The tracker's objects go through the floor-plane scene graph in `vg360-scenegraph/` and then into `iogp-runtime`, which evaluates the rules from iogp-editor's exported `config.json`. The code is `src/iogp.rs`. Its verdicts come out in two places:
+- the camera's report (`iogp`: events raised and cleared on the frame with their proofs, the alerts that hold now, the scene graph's counts), so they are on `/status` and `/v1/chat/completions`;
+- the metrics: `tamserve_iogp_alerts_active{rule,lsr}`, `_events_total{kind}`, `_positions_trusted` and `_coasting`.
+
+```json
+{ "rules": "config.json",
+  "site": "site.json",
+  "site_camera": "CAM-02",
+  "labels": {"car": "vehicle", "truck": "vehicle", "helmet": "hardhat"},
+  "params": {"coast_max_s": 2.0} }
+```
+
+- **`rules`**: iogp-editor's `/export/config.json`.
+- **`site`**: a vg360-scenegraph site file (decks, zones with `floor_polygon`, occluders, optional camera matrix for suspended-load drop zones; see `vg360-scenegraph/README.md`). `site_camera` defaults to the camera's name here.
+- **`labels`**: maps this detector's labels onto the catalog's detector names.
+- **With `safety` on the same camera**, the scene graph uses its calibration. The lens is undone first. A deck with no `homography` of its own takes the safety calibration's `H`. That means its zones' `floor_polygon`s are in the safety site's floor metres. Every frame applies the drift correction `G`. While the calibration is UNKNOWN, no position fact is emitted and every zone gets a `calibration-loss` signal: the same gate as the safety rules' `lost_never_clear` (whose system alert is `calibration-lost`). The catalog has the noun, so a rule can alert on it: "If a height-zone has a calibration-loss then VisionGuard raises a high working-at-height-alert."
+- **Without `safety`**, every deck needs its own homography or a camera matrix, and positions are always trusted.
+- **On a reconnect** the tracker's ids start again, so the scene graph's tracks are dropped. The rule engine is kept, so an alert that is up isn't raised twice.
+- **While a camera settles** after a light switch, the last verdicts are kept, as for `safety`.
+
+The spec is checked when the config loads: a missing file, an unknown site camera, or a deck that can't be placed stops the start.
+
+### Calibrating a site
+
+`config/iogp/` holds a worksheet for CAM-01 to CAM-04, prefilled from iogp-editor's catalog: each camera's decks and the zone instances it must show (Engine-Room; Moonpool and Crane-Deck; Rig-Floor-East; Pipe-Rack-2). It also has an `iogp` spec per camera. The measurements have to come from the rig. `vg360-site` turns them into `site.json` and refuses what doesn't fit:
+
+```text
+cargo run --release --manifest-path vg360-scenegraph/Cargo.toml --bin vg360-site -- \
+  fit config/iogp/worksheet.json --catalog <test1_logpeditor>/iogp-editor/data/vg360_catalog.json -o config/iogp/site.json
+```
+
+1. **A still per camera**, at the resolution tamserve-boxes decodes (`[decode]`, 640 x 360 here).
+2. **Per deck**:
+   - `image_polygon`: where the deck is in the picture;
+   - 6 to 10 `marks` spread over it, each `{"px": [u, v], "m": [x, y]}`: deck plate corners, painted lines or bolt heads whose position in metres comes from the drawings or a tape.
+   With a safety spec on the camera, use that spec's floor metres and copy its `K`/`D` into `lens`; the marks are then raw pixels.
+3. **Per zone**: `floor_polygon` in metres, or `image_polygon` drawn on the still, which is mapped through the deck's fit.
+4. **For drop zones under suspended loads** (optional): at least 6 `height_marks` on two or more levels at least 1 m apart, each `{"px", "m": [x, y, z]}` (handrail tops, column bands). These give the camera matrix, which is checked against the deck fits.
+5. **`occluders`**: equipment that hides people's feet.
+
+Each fit is reported (marks, RMS and worst residual). A mark more than 0.15 m off the fit is named so it can be measured again, and four marks are refused because they fit exactly and can't be checked. A catalog zone that isn't drawn on its camera is also refused. Copy iogp-editor's `/export/config.json` to `config/iogp/rules.json`, then set `iogp = "iogp/CAM-03.iogp.json"` on the camera.
+
+
 ## CPU and memory
 
 `tamserve-boxes bench` runs N synthetic 720p cameras at a set frame rate in this one process, or with `--separate`, one process per camera. Measured on a 2-core cloud VM (Intel Xeon, OpenVINO 2026.4, float32, `look_every=3`), **not an N100**. Decoding is left out, and both benchmarks hold about 27 MB of frames per camera, which is included below.
@@ -458,6 +503,7 @@ scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs m
   - retention: each kind of segment's days, the seconds before and after an event, segments past the log, the space order, pins, a sweep on disk, a bad pins file;
   - live fan-out: every viewer in order, a slow viewer dropped, the limits, a late viewer starting at the latest keyframe with the tables;
   - `tests/recording.rs`: one clip followed with the gate, recorded and watched at once (needs `x264enc` to make the clip).
+  - the IOGP spec (`tests/iogp.rs`, `config.rs`): found beside the config, checked; a worker placed through the safety calibration's lens and `H` raises LSR1 after 5 s; an UNKNOWN calibration raises nothing on the floor; a measured move puts a shifted worker back in the zone only with `G`; the crate's own tests in `vg360-scenegraph/`;
   - the safety spec in the config: found beside it, checked, refused with its mistakes; the drift route over a socket (token, unknown camera, bad JSON); `SafetyCam` from objects to verdicts, the label queue's file, a reconnect starting over, no barricade reported as unknown;
   - the drift check (`tests/drift.rs`): the notebook's frames with known corrections. Knocks are corrected to within 0.3 cm of OpenCV's ECC; steam, a covered lens and a 30° turn are refused; a saved reference loads back the same. A `SafetyCam` takes a reference when asked, corrects a knock, goes UNKNOWN when blind, and finds its reference again after a restart;
   - the PPE look (`tests/model.rs`, with the model): a crop's find maps back onto the object in the whole frame and replaces the main detector's;

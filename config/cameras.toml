@@ -68,6 +68,8 @@ record = true                    # to [record] dir, from this box's one connecti
 live = true                      # GET /live/gate.ts on [http]
 encode = true                    # and the [encode] uplink copy
 motion_mask = [[0.75, 0.0, 1.0, 0.08]]   # the clock overlay: no motion there
+# safety = "gate.safety.json"    # line of fire, red zone, barricade, PPE on the floor
+# iogp = "gate.iogp.json"        # IOGP Life-Saving Rule alerts from iogp-editor's rules (README: IOGP)
 
 [[camera]]
 name = "yard"
