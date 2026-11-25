@@ -42,6 +42,9 @@ impl Default for Policy {
     fn default() -> Self { Policy { inside: Emit::Possible, near: Emit::Possible, under: Emit::Possible, near_m: 3.0, near_classes: vec![], names: RelNames::default(), warnings: vec![] } }
 }
 
+/// One condition of a rule, as listed: rule id, negated, metres, and the two detector classes.
+type Row = (String, bool, Option<f64>, Option<String>, Option<String>);
+
 impl Policy {
     /// Derive the policy from (relation, negated, metres, subject detector, object detector) per condition.
     pub fn from_conditions<'a>(conds: impl IntoIterator<Item = (&'a str, bool, Option<f64>, Option<&'a str>, Option<&'a str>)>, names: RelNames) -> Policy {
@@ -84,7 +87,7 @@ impl Policy {
         let det = |r: &'_ iogp_runtime::Rule, v: &str| -> Option<String> {
             r.entities.iter().find(|e| e.var == v).and_then(|e| match &e.kind { NounKind::Class { detector, .. } => Some(detector.clone()), _ => None })
         };
-        let mut rows: Vec<(String, bool, Option<f64>, Option<String>, Option<String>)> = vec![];
+        let mut rows: Vec<Row> = vec![];
         for r in rules {
             for c in &r.conditions {
                 let m = match &c.kind { CondKind::Spatial { metres, .. } => *metres, _ => None };

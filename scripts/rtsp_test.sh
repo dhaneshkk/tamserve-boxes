@@ -41,13 +41,22 @@ check() {  # $1: a Python condition on s, $2: the status JSON, $3: what is being
   python3 -c "import json,sys; s=json.loads(sys.argv[1]); assert $1, sys.argv[1][:600]" "$2" || { echo "FAIL: $3"; exit 1; }
   echo "ok: $3"
 }
+# check, but waiting up to $4 seconds (default 30) for it to hold: what a fixed sleep guesses at
+# varies with the machine and, on the first run after a build, with OpenVINO compiling the model.
+eventually() {  # $1: a Python condition on s, $2: the box's HTTP port, $3: what is being checked
+  local end=$((SECONDS + ${4:-30}))
+  until python3 -c "import json,sys; s=json.loads(sys.argv[1]); assert $1" "$(status "$2" || echo '{}')" 2>/dev/null; do
+    [ "$SECONDS" -lt "$end" ] || { check "$1" "$(status "$2" || echo '{}')" "$3"; return; }
+    sleep 0.5
+  done
+  echo "ok: $3"
+}
 
 "$MTX" mediamtx.yml & sleep 1; publish; sleep 2
 box_config 19301 '[[camera]]\nname = "wrong"\nurl = "rtsp://127.0.0.1:18554/c1"\nuser = "admin"\npassword_file = "bad.pw"\n' > solo.toml
 "$B" run --config solo.toml > solo.jsonl 2> solo.log & SOLO=$!
-sleep 8
-check "all(s['cameras'][c]['state'] == 'up' for c in ['c1','c2','c3','c4'])" "$(status 19301)" "four cameras up over RTSP with a password"
-check "s['cameras']['wrong']['state'] == 'down' and 'nauthor' in s['cameras']['wrong']['last_error']" "$(status 19301)" "a wrong password is reported and retried"
+eventually "all(s['cameras'][c]['state'] == 'up' for c in ['c1','c2','c3','c4'])" 19301 "four cameras up over RTSP with a password"
+eventually "s['cameras']['wrong']['state'] == 'down' and 'nauthor' in (s['cameras']['wrong']['last_error'] or '')" 19301 "a wrong password is reported and retried"
 ARGS=$(ps -eo args | grep -v -e ffmpeg -e grep -e mediamtx || true)  # not `| grep -q`: under pipefail, its early exit could pass a failure
 ! grep -q "$PW" <<< "$ARGS" || { echo "FAIL: the password is on a command line"; exit 1; }
 echo "ok: no password on any tamserve-boxes command line"

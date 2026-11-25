@@ -60,6 +60,12 @@ jobs:
           cargo check --release --no-default-features --target aarch64-unknown-linux-gnu
       - name: Cameras without ONVIF
         run: cargo test --release --no-default-features --features fold,cameras
+      - name: "vg360-scenegraph: its own tests and benchmark"
+        working-directory: vg360-scenegraph
+        run: |
+          cargo test --release
+          cargo clippy --release --all-targets -- -D warnings
+          cargo run --release --example bench
 
   proofs:
     runs-on: ubuntu-24.04
@@ -69,5 +75,5 @@ jobs:
         run: |
           curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
             | sh -s -- -y --default-toolchain leanprover/lean4:v4.31.0
-          for f in proofs/*.lean; do "$HOME/.elan/bin/lean" "$f"; done
-          ! grep -n "sorry" proofs/*.lean
+          for f in proofs/*.lean vg360-scenegraph/formal/*.lean; do echo "$f"; "$HOME/.elan/bin/lean" "$f"; done
+          ! grep -nwE "sorry|admit" proofs/*.lean vg360-scenegraph/formal/*.lean

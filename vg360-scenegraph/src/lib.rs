@@ -24,6 +24,10 @@
 //! for e in engine.end() { println!("{} {} {}", e.kind, e.alert, e.subject); }
 //! ```
 
+// The fitting and assignment code indexes rows and columns of matrices by hand, where index
+// loops read like the maths; clippy's iterator rewrites of them would not.
+#![allow(clippy::needless_range_loop)]
+
 pub mod eval;
 pub mod fit;
 pub mod geom;
