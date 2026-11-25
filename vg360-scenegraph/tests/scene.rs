@@ -176,8 +176,8 @@ fn moved_camera_suppresses_positions_and_signals() {
     let dets = [Det { track_id: 1, class: "person", bbox: bbox(&p, 1.0, 10.0, 0.0, 0.5, 1.75), score: 0.9 }];
     let f = facts_of(&mut sg, 0.0, &dets, false);
     assert!(!f.facts.iter().any(|x| x.0 == "in" || x.0 == "near" || x.0 == "under"));
-    assert!(has(&f, "have", "Guard-1", "CAM-02/calibration-lost"));
-    assert!(f.objects.iter().any(|o| o.signal.as_deref() == Some("calibration-lost")));
+    assert!(has(&f, "have", "Guard-1", "CAM-02/calibration-loss"));
+    assert!(f.objects.iter().any(|o| o.signal.as_deref() == Some("calibration-loss")));
 }
 
 #[test]

@@ -16,7 +16,7 @@
 //! homography and drift state are used: a deck in the site file without a `homography` (and a
 //! camera without a `projection`) takes the safety calibration's `H`, the site camera takes its
 //! lens when it has none, the drift correction `G` is applied every frame, and while the
-//! calibration is UNKNOWN no position fact is emitted (`calibration-lost` is signalled instead),
+//! calibration is UNKNOWN no position fact is emitted (a `calibration-loss` signal on every zone instead; iogp-editor's catalog has the noun),
 //! the same gate as the safety rules' `lost_never_clear`.
 //!
 //! The verdicts are in the camera's report (`iogp`), on `/status`, on `/v1/chat/completions`

@@ -17,7 +17,11 @@ for e in engine.end() { /* alerts */ }
 
 `src/iogp.rs` runs one `SceneBuilder` + `iogp_runtime::Engine` per camera with `iogp` in its config, using the camera's safety calibration when it has one (see the top-level README, "IOGP Life-Saving Rule alerts").
 
-## Matching iogp-runtime (test1_logpeditor @ 499cf14)
+## Fitting a site: `vg360-site`
+
+`vg360-site fit WORKSHEET.json [--catalog CATALOG.json] [-o site.json]` fits deck homographies (normalised DLT, at least 4 marks) and, from height marks, the 3x4 camera matrix (at least 6, two or more levels). It maps image-drawn zones onto the floor and checks each fit's residuals and the catalog's zone instances. The worksheet format is documented in `src/fit.rs`, and `tests/fit.rs` covers clean marks, noise, a mis-measured mark, too few marks, the camera matrix and catalog checks.
+
+## Matching iogp-runtime (test1_logpeditor @ e6e2888, MIT)
 
 | | |
 |---|---|
@@ -51,8 +55,8 @@ Other behaviour:
 * An occluded person is coasted for up to `coast_max_s`. While coasting, the person keeps asserting what they last wore or
   carried, so an occlusion doesn't become "does not wear a harness".
 * `camera_ok = false` (from camera_guard) suppresses every position fact and emits a
-  `calibration-lost` signal on each zone. **Add `calibration-lost` to the catalog's `signals`**
-  so a rule can alert on it (for example, "If a height-zone has a calibration-lost then ...").
+  `calibration-loss` signal on each zone. iogp-editor's catalog has the noun, so a rule can alert
+  on it: "If a height-zone has a calibration-loss then VisionGuard raises a high working-at-height-alert."
 
 Uncertain relations are emitted with the polarity the rules need: *possibly* if the relation is used positively,
 *definitely* if it is used only under negation. `formal/SceneFacts.lean` proves that, given the k·σ error bound, this never

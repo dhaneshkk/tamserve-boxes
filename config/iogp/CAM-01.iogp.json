@@ -1,0 +1,12 @@
+{
+  "rules": "rules.json",
+  "site": "site.json",
+  "site_camera": "CAM-01",
+  "labels": {
+    "car": "vehicle",
+    "truck": "vehicle",
+    "bus": "vehicle",
+    "helmet": "hardhat",
+    "vest": "hi_vis_vest"
+  }
+}

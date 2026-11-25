@@ -389,12 +389,33 @@ A camera with `iogp = "gate.iogp.json"` in its config also runs the IOGP alert r
 - **`rules`**: iogp-editor's `/export/config.json`.
 - **`site`**: a vg360-scenegraph site file (decks, zones with `floor_polygon`, occluders, optional camera matrix for suspended-load drop zones; see `vg360-scenegraph/README.md`). `site_camera` defaults to the camera's name here.
 - **`labels`**: maps this detector's labels onto the catalog's detector names.
-- **With `safety` on the same camera**, the scene graph uses its calibration. The lens is undone first. A deck with no `homography` of its own takes the safety calibration's `H`. That means its zones' `floor_polygon`s are in the safety site's floor metres. Every frame applies the drift correction `G`. While the calibration is UNKNOWN, no position fact is emitted and every zone gets a `calibration-lost` signal: the same gate as the safety rules' `lost_never_clear`. Add `calibration-lost` to the catalog's `signals` to write a rule on it.
+- **With `safety` on the same camera**, the scene graph uses its calibration. The lens is undone first. A deck with no `homography` of its own takes the safety calibration's `H`. That means its zones' `floor_polygon`s are in the safety site's floor metres. Every frame applies the drift correction `G`. While the calibration is UNKNOWN, no position fact is emitted and every zone gets a `calibration-loss` signal: the same gate as the safety rules' `lost_never_clear` (whose system alert is `calibration-lost`). The catalog has the noun, so a rule can alert on it: "If a height-zone has a calibration-loss then VisionGuard raises a high working-at-height-alert."
 - **Without `safety`**, every deck needs its own homography or a camera matrix, and positions are always trusted.
 - **On a reconnect** the tracker's ids start again, so the scene graph's tracks are dropped. The rule engine is kept, so an alert that is up isn't raised twice.
 - **While a camera settles** after a light switch, the last verdicts are kept, as for `safety`.
 
 The spec is checked when the config loads: a missing file, an unknown site camera, or a deck that can't be placed stops the start.
+
+### Calibrating a site
+
+`config/iogp/` holds a worksheet for CAM-01 to CAM-04, prefilled from iogp-editor's catalog: each camera's decks and the zone instances it must show (Engine-Room; Moonpool and Crane-Deck; Rig-Floor-East; Pipe-Rack-2). It also has an `iogp` spec per camera. The measurements have to come from the rig. `vg360-site` turns them into `site.json` and refuses what doesn't fit:
+
+```text
+cargo run --release --manifest-path vg360-scenegraph/Cargo.toml --bin vg360-site -- \
+  fit config/iogp/worksheet.json --catalog <test1_logpeditor>/iogp-editor/data/vg360_catalog.json -o config/iogp/site.json
+```
+
+1. **A still per camera**, at the resolution tamserve-boxes decodes (`[decode]`, 640 x 360 here).
+2. **Per deck**:
+   - `image_polygon`: where the deck is in the picture;
+   - 6 to 10 `marks` spread over it, each `{"px": [u, v], "m": [x, y]}`: deck plate corners, painted lines or bolt heads whose position in metres comes from the drawings or a tape.
+   With a safety spec on the camera, use that spec's floor metres and copy its `K`/`D` into `lens`; the marks are then raw pixels.
+3. **Per zone**: `floor_polygon` in metres, or `image_polygon` drawn on the still, which is mapped through the deck's fit.
+4. **For drop zones under suspended loads** (optional): at least 6 `height_marks` on two or more levels at least 1 m apart, each `{"px", "m": [x, y, z]}` (handrail tops, column bands). These give the camera matrix, which is checked against the deck fits.
+5. **`occluders`**: equipment that hides people's feet.
+
+Each fit is reported (marks, RMS and worst residual). A mark more than 0.15 m off the fit is named so it can be measured again, and four marks are refused because they fit exactly and can't be checked. A catalog zone that isn't drawn on its camera is also refused. Copy iogp-editor's `/export/config.json` to `config/iogp/rules.json`, then set `iogp = "iogp/CAM-03.iogp.json"` on the camera.
+
 
 ## CPU and memory
 

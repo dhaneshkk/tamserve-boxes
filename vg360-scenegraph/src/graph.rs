@@ -66,7 +66,7 @@ impl Default for Params {
             load_height_m: [1.0, 12.0], load_samples: 8, load_margin_m: 0.5, ppe_containment: 0.6,
             ppe_bands: vec![b("hardhat", 0.0, 0.3), b("hi_vis_vest", 0.15, 0.7), b("harness", 0.1, 0.8)],
             human_classes: vec!["person".into()], load_classes: vec!["suspended_load".into()],
-            calibration_signal: Some("calibration-lost".into()), max_nodes: 128, max_tracks: 256,
+            calibration_signal: Some("calibration-loss".into()), max_nodes: 128, max_tracks: 256,
         }
     }
 }
@@ -144,7 +144,7 @@ const R_WEAR: u8 = 0; const R_CARRY: u8 = 1; const R_HOLD: u8 = 2; const R_USE: 
 
 impl SceneBuilder {
     pub fn new(cam: Camera, params: Params, policy: Policy) -> SceneBuilder {
-        let calib_id = format!("{}/{}", cam.name, params.calibration_signal.as_deref().unwrap_or("calibration-lost"));
+        let calib_id = format!("{}/{}", cam.name, params.calibration_signal.as_deref().unwrap_or("calibration-loss"));
         SceneBuilder {
             tracks: (0..params.max_tracks).map(|_| Track::empty()).collect(),
             nodes: Vec::with_capacity(params.max_nodes),

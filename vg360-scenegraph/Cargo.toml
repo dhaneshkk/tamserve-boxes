@@ -13,7 +13,7 @@ iogp = ["dep:iogp-runtime"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-iogp-runtime = { git = "https://github.com/dhaneshkk/test1_logpeditor", rev = "499cf14a79425eaabe603c3e6fc7d10944df8dd7", optional = true }
+iogp-runtime = { git = "https://github.com/dhaneshkk/test1_logpeditor", rev = "e6e28884e8c2274bb32a7ecfe689dcf9f2913b10", optional = true }
 
 [profile.release]
 debug = false

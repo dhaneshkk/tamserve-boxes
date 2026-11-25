@@ -1,0 +1,196 @@
+{
+  "_comment": [
+    "Calibration worksheet for vg360-site (vg360-scenegraph). Fill in on site, then:",
+    "  cargo run --release --manifest-path vg360-scenegraph/Cargo.toml --bin vg360-site -- fit config/iogp/worksheet.json --catalog <test1_logpeditor>/iogp-editor/data/vg360_catalog.json -o config/iogp/site.json",
+    "Pixels are of the stream tamserve-boxes decodes ([decode] width x height, here 640 x 360), read off a still of it.",
+    "Per deck: image_polygon = where that deck is visible; marks = 6-10 points spread over it, {px: [u, v], m: [x, y]} in metres of one deck datum per camera.",
+    "With a safety spec on the camera, use that spec's floor metres for m, and copy its K and D into lens (marks are then raw pixels).",
+    "Per zone: floor_polygon in metres (from the rig drawings), or image_polygon drawn on the still (mapped through the deck's fit).",
+    "Optional height_marks (>= 6, at least two levels 1 m apart: handrail tops, column bands): {px, m: [x, y, z]} -> camera matrix for drop zones under suspended loads.",
+    "occluders: image polygons of equipment that hides people's feet."
+  ],
+  "cameras": [
+    {
+      "name": "CAM-01",
+      "description": "engine room",
+      "image_size": [
+        640,
+        360
+      ],
+      "decks": [
+        {
+          "id": "engine-room-floor",
+          "elevation_m": 0.0,
+          "note": "engine room deck plates",
+          "image_polygon": [
+            [
+              0,
+              0
+            ],
+            [
+              640,
+              0
+            ],
+            [
+              640,
+              360
+            ],
+            [
+              0,
+              360
+            ]
+          ],
+          "marks": []
+        }
+      ],
+      "height_marks": [],
+      "occluders": [],
+      "zones": [
+        {
+          "id": "Engine-Room",
+          "type": "confined-space",
+          "deck": "engine-room-floor",
+          "note": "TODO: floor_polygon (metres) or image_polygon (pixels)"
+        }
+      ]
+    },
+    {
+      "name": "CAM-02",
+      "description": "moonpool and crane deck",
+      "image_size": [
+        640,
+        360
+      ],
+      "decks": [
+        {
+          "id": "main-deck",
+          "elevation_m": 0.0,
+          "note": "moonpool deck and crane laydown, if they are one level; split into two decks if not",
+          "image_polygon": [
+            [
+              0,
+              0
+            ],
+            [
+              640,
+              0
+            ],
+            [
+              640,
+              360
+            ],
+            [
+              0,
+              360
+            ]
+          ],
+          "marks": []
+        }
+      ],
+      "height_marks": [],
+      "occluders": [],
+      "zones": [
+        {
+          "id": "Moonpool",
+          "type": "restricted-area",
+          "deck": "main-deck",
+          "note": "TODO: floor_polygon (metres) or image_polygon (pixels)"
+        },
+        {
+          "id": "Crane-Deck",
+          "type": "lifting-zone",
+          "deck": "main-deck",
+          "note": "TODO: floor_polygon (metres) or image_polygon (pixels)"
+        }
+      ]
+    },
+    {
+      "name": "CAM-03",
+      "description": "rig floor, east",
+      "image_size": [
+        640,
+        360
+      ],
+      "decks": [
+        {
+          "id": "drill-floor",
+          "elevation_m": 0.0,
+          "note": "drill floor; elevation relative to this camera's own datum",
+          "image_polygon": [
+            [
+              0,
+              0
+            ],
+            [
+              640,
+              0
+            ],
+            [
+              640,
+              360
+            ],
+            [
+              0,
+              360
+            ]
+          ],
+          "marks": []
+        }
+      ],
+      "height_marks": [],
+      "occluders": [],
+      "zones": [
+        {
+          "id": "Rig-Floor-East",
+          "type": "height-zone",
+          "deck": "drill-floor",
+          "note": "TODO: floor_polygon (metres) or image_polygon (pixels)"
+        }
+      ]
+    },
+    {
+      "name": "CAM-04",
+      "description": "pipe rack",
+      "image_size": [
+        640,
+        360
+      ],
+      "decks": [
+        {
+          "id": "pipe-rack-walkway",
+          "elevation_m": 0.0,
+          "note": "walkway grating along Pipe-Rack-2; set elevation_m if this camera also sees the main deck",
+          "image_polygon": [
+            [
+              0,
+              0
+            ],
+            [
+              640,
+              0
+            ],
+            [
+              640,
+              360
+            ],
+            [
+              0,
+              360
+            ]
+          ],
+          "marks": []
+        }
+      ],
+      "height_marks": [],
+      "occluders": [],
+      "zones": [
+        {
+          "id": "Pipe-Rack-2",
+          "type": "height-zone",
+          "deck": "pipe-rack-walkway",
+          "note": "TODO: floor_polygon (metres) or image_polygon (pixels)"
+        }
+      ]
+    }
+  ]
+}

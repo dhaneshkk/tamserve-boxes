@@ -25,6 +25,7 @@
 //! ```
 
 pub mod eval;
+pub mod fit;
 pub mod geom;
 pub mod graph;
 pub mod policy;
