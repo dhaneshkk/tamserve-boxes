@@ -34,6 +34,7 @@ use crate::motion::{Gate, MotionOptions};
 use crate::restream::{Chunk, Tap};
 use crate::lens::{CalibState, DriftEstimate};
 use crate::retention::{ActivityLog, Policy, Sweep};
+use crate::iogp::{IogpCam, IogpReport, IogpSpec};
 use crate::safety::{CameraSafety, SafetyCam, SafetySpec};
 use crate::{BBox, BoxTracker, Detector, GrayFrame, Result};
 
@@ -55,6 +56,9 @@ pub struct Report {
     /// The safety rules' verdicts, for a camera with `safety` in its config.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safety: Option<CameraSafety>,
+    /// IOGP Life-Saving Rule alerts, for a camera with `iogp` in its config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iogp: Option<IogpReport>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -133,6 +137,7 @@ pub struct Runner {
     record: Option<PathBuf>,
     logs: HashMap<String, ActivityLog>,
     safety: HashMap<String, SafetyCam>,
+    iogp: HashMap<String, IogpCam>,
     pub shared: Arc<Shared>,
 }
 
@@ -143,7 +148,7 @@ impl Runner {
         Runner { tracker, sources: BTreeMap::new(), opening, bell: Arc::new(Bell::default()), rung: 0,
                  generation: HashMap::new(), motion: None,
                  light: Lights { opts: LightOptions::default(), cameras: HashMap::new() },
-                 record: None, logs: HashMap::new(), safety: HashMap::new(), shared }
+                 record: None, logs: HashMap::new(), safety: HashMap::new(), iogp: HashMap::new(), shared }
     }
 
     /// How day, night and IR switches are found ([`crate::light`]). Without this, the
@@ -212,6 +217,7 @@ impl Runner {
             self.generation.remove(n);
             self.light.cameras.remove(n);
             self.safety.remove(n);
+            self.iogp.remove(n);
             self.shared.drift.lock().unwrap().remove(n);
             if let Some(m) = &mut self.motion {
                 m.cameras.remove(n);
@@ -232,6 +238,12 @@ impl Runner {
             self.shared.cameras.lock().unwrap().insert(c.name.clone(),
                 View { label: c.label(), health: s.health.clone(), latest: None, motion: Vec::new(), live: s.live.clone(),
                        safety: safety.is_some() });
+            if let Some(p) = &c.iogp {
+                let calib = safety.as_ref().map(|s| s.calib.clone());
+                let spec = IogpSpec::load(p, &c.name, calib.as_ref())?;
+                let cam = IogpCam::new(&spec, &c.name, calib.as_ref()).map_err(|e| crate::Error::Invalid(format!("camera {:?}: {e}", c.name)))?;
+                self.iogp.insert(c.name.clone(), cam);
+            }
             if let Some(spec) = safety {
                 self.safety.insert(c.name.clone(), SafetyCam::new(spec)?);
             }
@@ -280,6 +292,9 @@ impl Runner {
                     }
                     if let Some(sc) = self.safety.get_mut(name) {
                         sc.reset();
+                    }
+                    if let Some(ic) = self.iogp.get_mut(name) {
+                        ic.reset();
                     }
                 }
                 s.health.used.fetch_add(1, Ordering::Relaxed);
@@ -370,8 +385,17 @@ impl Runner {
                 }
                 None => None,
             };
+            let iogp = match self.iogp.get_mut(name) {
+                // Settling: nothing was looked at; keep the last verdicts.
+                Some(_) if light.settling => views.get(name).and_then(|v| v.latest.as_ref()).and_then(|r| r.iogp.clone()),
+                Some(ic) => {
+                    let calib = self.safety.get(name).map(|sc| { let c = sc.calibration(); (c.state, c.g) });
+                    Some(ic.process(t as f64 / 1000.0, objects.iter().map(|o| (o.id, o.label.as_str(), o.score, o.bbox)), calib))
+                }
+                None => None,
+            };
             let r: Report = Report { camera: name.clone(), frame: f.number, time_ms: t, objects,
-                                     light: light.mode, settling: light.settling, safety };
+                                     light: light.mode, settling: light.settling, safety, iogp };
             let motion = moved.remove(name).unwrap_or_default();
             if let Some(log) = self.logs.get_mut(name) {
                 let mut labels: Vec<String> = r.objects.iter().map(|o| o.label.clone()).collect();
@@ -525,6 +549,32 @@ impl crate::http::Source for Shared {
                                  tamserve_recordings_deleted_total{{why=\"expired\"}} {}\ntamserve_recordings_deleted_total{{why=\"space\"}} {}",
                              r.deleted_expired, r.deleted_space);
             let _ = writeln!(m, "# HELP tamserve_recordings_sweep_errors_total sweeps that failed\n# TYPE tamserve_recordings_sweep_errors_total counter\ntamserve_recordings_sweep_errors_total {}", r.errors);
+        }
+        let rules: Vec<(&String, &IogpReport)> = cams.iter().filter_map(|(n, v)| v.latest.as_ref()?.iogp.as_ref().map(|s| (n, s))).collect();
+        if !rules.is_empty() {
+            let _ = writeln!(m, "# HELP tamserve_iogp_alerts_active IOGP alerts that hold now, by rule and Life-Saving Rule\n# TYPE tamserve_iogp_alerts_active gauge");
+            for (cam, r) in &rules {
+                let mut by: BTreeMap<(&str, u8), usize> = BTreeMap::new();
+                for a in &r.active {
+                    *by.entry((a.rule.as_str(), a.lsr)).or_default() += 1;
+                }
+                for ((rule, lsr), n) in by {
+                    let _ = writeln!(m, "tamserve_iogp_alerts_active{{camera=\"{}\",rule=\"{}\",lsr=\"{lsr}\"}} {n}", label(cam), label(rule));
+                }
+            }
+            let _ = writeln!(m, "# HELP tamserve_iogp_events_total IOGP alerts raised and cleared since the start\n# TYPE tamserve_iogp_events_total counter");
+            for (cam, r) in &rules {
+                let _ = writeln!(m, "tamserve_iogp_events_total{{camera=\"{}\",kind=\"raised\"}} {}", label(cam), r.raised_total);
+                let _ = writeln!(m, "tamserve_iogp_events_total{{camera=\"{}\",kind=\"cleared\"}} {}", label(cam), r.cleared_total);
+            }
+            let _ = writeln!(m, "# HELP tamserve_iogp_positions_trusted 1 while floor positions feed the rules; 0 while the calibration is unknown\n# TYPE tamserve_iogp_positions_trusted gauge");
+            for (cam, r) in &rules {
+                let _ = writeln!(m, "tamserve_iogp_positions_trusted{{camera=\"{}\"}} {}", label(cam), u8::from(r.positions_trusted));
+            }
+            let _ = writeln!(m, "# HELP tamserve_iogp_coasting people kept on the floor through an occlusion\n# TYPE tamserve_iogp_coasting gauge");
+            for (cam, r) in &rules {
+                let _ = writeln!(m, "tamserve_iogp_coasting{{camera=\"{}\"}} {}", label(cam), r.coasting);
+            }
         }
         m
     }

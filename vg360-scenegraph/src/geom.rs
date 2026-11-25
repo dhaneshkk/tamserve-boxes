@@ -25,17 +25,19 @@ pub fn mul3v(m: &M3, v: [f64; 3]) -> [f64; 3] {
     [0, 1, 2].map(|i| m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2])
 }
 
-/// Image pixel -> deck metres. `None` when the point is on/behind the horizon (w <= 0).
+/// Image pixel -> deck metres. `None` on the horizon (w = 0). A fitted homography's overall sign
+/// is arbitrary (-H is the same map), so negative w is fine; which pixels are on a deck is the
+/// deck's image polygon's job.
 pub fn h_apply(h: &M3, p: P2) -> Option<P2> {
     let [x, y, w] = mul3v(h, [p.0, p.1, 1.0]);
-    if w <= 1e-12 { return None; }
+    if w.abs() <= 1e-12 { return None; }
     Some((x / w, y / w))
 }
 
 /// Jacobian d(X,Y)/d(u,v) of the homography at pixel p.
 pub fn h_jacobian(h: &M3, p: P2) -> Option<M2> {
     let [x, y, w] = mul3v(h, [p.0, p.1, 1.0]);
-    if w <= 1e-12 { return None; }
+    if w.abs() <= 1e-12 { return None; }
     let w2 = w * w;
     Some([
         [(h[0][0] * w - x * h[2][0]) / w2, (h[0][1] * w - x * h[2][1]) / w2],
@@ -80,6 +82,57 @@ pub fn ray_at_height(p: &[[f64; 4]; 3], px: P2, z: f64) -> Option<P2> {
     let s = (z - c[2]) / d[2];
     Some((c[0] + s * d[0], c[1] + s * d[1]))
 }
+
+
+/// OpenCV's pinhole + `k1 k2 p1 p2 k3` lens. `undistort` is tamserve-boxes' `lens::Lens::undistort`
+/// (Newton on the forward model to 1e-9 px), so both put a pixel at the same floor point.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct Lens {
+    #[serde(rename = "K")] pub k: M3,
+    #[serde(rename = "D")] pub d: [f64; 5],
+}
+
+impl Lens {
+    pub fn undistort(&self, u: f64, v: f64) -> P2 {
+        if self.d.iter().all(|&c| c == 0.0) { return (u, v); }
+        let (fx, fy, cx, cy) = (self.k[0][0], self.k[1][1], self.k[0][2], self.k[1][2]);
+        let [k1, k2, p1, p2, k3] = self.d;
+        let (xd, yd) = ((u - cx) / fx, (v - cy) / fy);
+        let (mut x, mut y) = (xd, yd);
+        for _ in 0..50 {
+            let r2 = x * x + y * y;
+            let cd = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2;
+            let dc = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r2 * r2;
+            let ex = x * cd + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x) - xd;
+            let ey = y * cd + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y - yd;
+            let (tx, ty) = (ex * fx, ey * fy);
+            if (tx * tx + ty * ty).sqrt() < 1e-9 { break; }
+            let a = cd + 2.0 * x * x * dc + 2.0 * p1 * y + 6.0 * p2 * x;
+            let b = 2.0 * x * y * dc + 2.0 * p1 * x + 2.0 * p2 * y;
+            let d = cd + 2.0 * y * y * dc + 6.0 * p1 * y + 2.0 * p2 * x;
+            let det = a * d - b * b;
+            let (nx, ny) = (x - (d * ex - b * ey) / det, y - (a * ey - b * ex) / det);
+            x = nx;
+            y = ny;
+        }
+        (fx * x + cx, fy * y + cy)
+    }
+    /// The observed pixel of an ideal one (OpenCV's forward model).
+    pub fn distort(&self, u: f64, v: f64) -> P2 {
+        let (fx, fy, cx, cy) = (self.k[0][0], self.k[1][1], self.k[0][2], self.k[1][2]);
+        let [k1, k2, p1, p2, k3] = self.d;
+        let (x, y) = ((u - cx) / fx, (v - cy) / fy);
+        let r2 = x * x + y * y;
+        let c = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2;
+        let (xd, yd) = (x * c + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x), y * c + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y);
+        (xd * fx + cx, yd * fy + cy)
+    }
+}
+
+pub fn matmul3(a: &M3, b: &M3) -> M3 {
+    [0, 1, 2].map(|i| [0, 1, 2].map(|j| a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j]))
+}
+pub const IDENTITY: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
 /// Ray-casting point-in-polygon (same rule as iogp-editor's ingest).
 pub fn in_polygon(poly: &[[f64; 2]], p: P2) -> bool {
@@ -143,6 +196,16 @@ mod tests {
         assert!(((a.1 - b.1) / (2.0 * e) - j[1][1]).abs() < 1e-7);
     }
     #[test]
+    fn negated_homography_is_the_same_map() {
+        let h: M3 = [[0.02, 0.001, -3.0], [0.0005, 0.03, -5.0], [0.0001, 0.0008, 1.0]];
+        let n: M3 = h.map(|r| r.map(|v| -v));
+        let p = (640.0, 420.0);
+        let (a, b) = (h_apply(&h, p).unwrap(), h_apply(&n, p).unwrap());
+        assert!((a.0 - b.0).abs() < 1e-12 && (a.1 - b.1).abs() < 1e-12);
+        let (ja, jb) = (h_jacobian(&h, p).unwrap(), h_jacobian(&n, p).unwrap());
+        assert!((ja[0][0] - jb[0][0]).abs() < 1e-12 && (ja[1][1] - jb[1][1]).abs() < 1e-12);
+    }
+    #[test]
     fn plane_homography_inverts_projection() {
         // camera 10 m up looking down-forward
         let p = [[800.0, 0.0, 640.0, 0.0], [0.0, -400.0, 360.0 + 300.0, -4000.0], [0.0, 0.5, 0.866, 10.0]];
@@ -155,6 +218,15 @@ mod tests {
             assert!((back.0 - 3.0).abs() < 1e-6 && (back.1 - 7.0).abs() < 1e-6);
             let r = ray_at_height(&p, px, z0).unwrap();
             assert!((r.0 - 3.0).abs() < 1e-6 && (r.1 - 7.0).abs() < 1e-6);
+        }
+    }
+    #[test]
+    fn undistort_inverts_distort() {
+        let l = Lens { k: [[230.0, 0.0, 320.0], [0.0, 230.0, 240.0], [0.0, 0.0, 1.0]], d: [-0.32, 0.10, 0.0005, -0.0004, 0.0] };
+        for &(u, v) in &[(320.0, 240.0), (5.0, 5.0), (635.0, 470.0), (100.0, 400.0)] {
+            let (x, y) = l.undistort(u, v);
+            let (u2, v2) = l.distort(x, y);
+            assert!((u2 - u).abs() < 1e-6 && (v2 - v).abs() < 1e-6);
         }
     }
 }

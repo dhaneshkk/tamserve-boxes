@@ -1137,6 +1137,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "iogp-runtime"
+version = "0.1.0"
+source = "git+https://github.com/dhaneshkk/test1_logpeditor?rev=499cf14a79425eaabe603c3e6fc7d10944df8dd7#499cf14a79425eaabe603c3e6fc7d10944df8dd7"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2133,6 +2142,7 @@ dependencies = [
  "gstreamer-video",
  "hmac",
  "image",
+ "iogp-runtime",
  "libc",
  "onnx-protobuf",
  "onvif",
@@ -2146,6 +2156,7 @@ dependencies = [
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "url",
+ "vg360-scenegraph",
 ]
 
 [[package]]
@@ -2504,6 +2515,15 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vg360-scenegraph"
+version = "0.1.0"
+dependencies = [
+ "iogp-runtime",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "want"

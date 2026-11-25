@@ -43,6 +43,7 @@ pub mod fold;
 pub mod grammar;
 pub mod http;
 pub mod image;
+pub mod iogp;
 mod kalman;
 pub mod lens;
 pub mod light;

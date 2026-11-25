@@ -13,6 +13,10 @@ sg.step(t, &dets, camera_guard_ok, &mut engine);
 for e in engine.end() { /* alerts */ }
 ```
 
+## In tamserve-boxes
+
+`src/iogp.rs` runs one `SceneBuilder` + `iogp_runtime::Engine` per camera with `iogp` in its config, using the camera's safety calibration when it has one (see the top-level README, "IOGP Life-Saving Rule alerts").
+
 ## Matching iogp-runtime (test1_logpeditor @ 499cf14)
 
 | | |
@@ -35,7 +39,13 @@ for e in engine.end() { /* alerts */ }
 | `wear` | ≥ 60 % containment **plus** a vertical band per PPE class (helmet in the top 30 %, ...) | containment only for unbanded classes |
 
 Other behaviour:
-* Pixel noise is pushed through the homography Jacobian, so far-field workers get wider uncertainty.
+* With a `lens` (K, D) in the site camera, points are undistorted before any homography or ray
+  (`floor = H · G · undistort(p)`, the same model as tamserve-boxes' `lens.rs`). Image polygons
+  (decks, zones, occluders) stay in raw pixels. `SceneBuilder::set_view_correction(G)` takes the
+  drift check's correction every frame.
+* A fitted homography's sign is arbitrary: negative `w` is accepted, and the deck's image polygon
+  decides which pixels belong to it.
+* Pixel noise is pushed through the homography Jacobian (numerically when there is a lens), so far-field workers get wider uncertainty.
 * When the feet are hidden (by an occluder polygon or the image bottom edge), the foot point is
   recovered from the box top and the person aspect ratio, with inflated σ.
 * An occluded person is coasted for up to `coast_max_s`. While coasting, the person keeps asserting what they last wore or

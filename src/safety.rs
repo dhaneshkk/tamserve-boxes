@@ -362,6 +362,16 @@ impl SafetyCam {
         }
     }
 
+    /// The floor calibration as the last frame left it: lens, H, drift correction G and state.
+    pub fn calibration(&self) -> &Calibration {
+        &self.engine.calib
+    }
+
+    /// The spec's calibration, as loaded.
+    pub fn calib_spec(&self) -> &CalibSpec {
+        &self.spec.calib
+    }
+
     /// Take the next frame as the reference for its light mode (the view must be the
     /// calibrated one, or one whose correction the calibration already holds).
     pub fn request_reference(&mut self) -> bool {

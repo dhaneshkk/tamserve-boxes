@@ -16,10 +16,11 @@ use std::fmt::Write as _;
 pub struct Det<'a> { pub track_id: u64, pub class: &'a str, pub bbox: BBox, pub score: f64 }
 
 /// A PPE class and where on the person its centre must fall (fractions of box height from the top).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
 pub struct PpeBand { pub class: String, pub top: f64, pub bottom: f64 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Params {
     /// k in "within k standard deviations" for the three-valued relations
     pub k_sigma: f64,
@@ -134,6 +135,8 @@ pub struct SceneBuilder {
     order: Vec<u16>,
     drops: Vec<DropZone>,
     calib_id: String,
+    /// drift correction G: current undistorted view -> calibrated one
+    view_g: M3,
     pub stats: Stats,
 }
 
@@ -147,8 +150,31 @@ impl SceneBuilder {
             nodes: Vec::with_capacity(params.max_nodes),
             order: Vec::with_capacity(params.max_nodes),
             drops: Vec::with_capacity(16),
-            cam, params, policy, calib_id, stats: Stats::default(),
+            cam, params, policy, calib_id, view_g: IDENTITY, stats: Stats::default(),
         }
+    }
+
+    /// The drift correction G from tamserve-boxes' `lens::Calibration` (current undistorted view to
+    /// the calibrated one); identity until a drift check measures a move.
+    pub fn set_view_correction(&mut self, g: M3) { self.view_g = g; }
+
+    /// A raw pixel in the calibrated, undistorted view: `G · undistort(p)`.
+    pub fn to_ref(&self, p: P2) -> P2 {
+        let q = match &self.cam.lens { Some(l) => l.undistort(p.0, p.1), None => p };
+        if self.view_g == IDENTITY { q } else { h_apply(&self.view_g, q).unwrap_or(q) }
+    }
+
+    /// A raw pixel on deck `di`, in metres, and the Jacobian of that map at the pixel.
+    pub fn floor_map(&self, di: usize, p: P2) -> Option<(P2, M2)> {
+        let h = &self.cam.decks[di].h;
+        if self.cam.lens.is_none() {
+            let hg = matmul3(h, &self.view_g);
+            return Some((h_apply(&hg, p)?, h_jacobian(&hg, p)?));
+        }
+        let f = |q: P2| h_apply(h, self.to_ref(q));
+        let e = 0.5;
+        let (c, xp, xm, yp, ym) = (f(p)?, f((p.0 + e, p.1))?, f((p.0 - e, p.1))?, f((p.0, p.1 + e))?, f((p.0, p.1 - e))?);
+        Some((c, [[(xp.0 - xm.0) / (2.0 * e), (yp.0 - ym.0) / (2.0 * e)], [(xp.1 - xm.1) / (2.0 * e), (yp.1 - ym.1) / (2.0 * e)]]))
     }
 
     /// The graph built by the last [`SceneBuilder::step`] (for overlays and debugging).
@@ -215,8 +241,7 @@ impl SceneBuilder {
             let (mut floor, mut cov) = ((0.0, 0.0), [[0.0; 2]; 2]);
             let mut deck_used = None;
             if let Some(di) = deck {
-                let h = &self.cam.decks[di].h;
-                if let (Some(fl), Some(j)) = (h_apply(h, foot_px), h_jacobian(h, foot_px)) {
+                if let Some((fl, j)) = self.floor_map(di, foot_px) {
                     let mut s = self.params.px_sigma_frac * (d.bbox[3] - d.bbox[1]) + self.params.px_sigma_floor;
                     if est { s *= self.params.est_sigma_mul; }
                     let r = propagate(&j, s * 0.5, s); // feet are better localised across than along the image column
@@ -344,7 +369,7 @@ impl SceneBuilder {
             for (li, ln) in self.nodes.iter().enumerate() {
                 if ln.role != Role::Load || ln.coasting { continue; }
                 let b = ln.bbox;
-                let (bc, bl, br) = (((b[0] + b[2]) / 2.0, b[3]), (b[0], b[3]), (b[2], b[3]));
+                let (bc, bl, br) = (self.to_ref(((b[0] + b[2]) / 2.0, b[3])), self.to_ref((b[0], b[3])), self.to_ref((b[2], b[3])));
                 for (di, deck) in self.cam.decks.iter().enumerate() {
                     let ns = self.params.load_samples.clamp(2, 16);
                     let mut dz = DropZone { node: li, deck: di, pts: [(0.0, 0.0); 16], n: 0, radius: 0.0 };

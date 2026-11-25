@@ -41,6 +41,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"], opti
 futures-util = { version = "0.3", default-features = false, optional = true }
 reqwest = { version = "0.13", default-features = false, optional = true }  # onvif-rs's, for its Certificate type
 fearless_simd = "1"
+# IOGP Life-Saving Rule alerts (src/iogp.rs): the floor-plane scene graph in this repo, and the rule
+# engine from iogp-editor, pinned to the rev the scene graph was built against.
+vg360-scenegraph = { path = "vg360-scenegraph" }
+iogp-runtime = { git = "https://github.com/dhaneshkk/test1_logpeditor", rev = "499cf14a79425eaabe603c3e6fc7d10944df8dd7" }
 fearless_simd_macros = "0.1"
 
 [dev-dependencies]
