@@ -21,7 +21,7 @@ for e in engine.end() { /* alerts */ }
 
 `vg360-site fit WORKSHEET.json [--catalog CATALOG.json] [-o site.json]` fits deck homographies (normalised DLT, at least 4 marks) and, from height marks, the 3x4 camera matrix (at least 6, two or more levels). It maps image-drawn zones onto the floor and checks each fit's residuals and the catalog's zone instances. The worksheet format is documented in `src/fit.rs`, and `tests/fit.rs` covers clean marks, noise, a mis-measured mark, too few marks, the camera matrix and catalog checks.
 
-## Matching iogp-runtime (test1_logpeditor @ e6e2888, MIT)
+## Matching iogp-runtime (test1_logpeditor @ eaf4b26, MIT)
 
 | | |
 |---|---|
