@@ -57,7 +57,7 @@ fn one_connection_is_followed_recorded_and_watched() {
         .with_motion(MotionOptions { alpha: 0.1, ..Default::default() }, true, 5).unwrap()
         .with_recording(rec.clone(), Duration::from_secs(2), policy, Duration::from_secs(3600)).unwrap();
     let cam = Camera { name: "gate".into(), url: video.display().to_string(), onvif: None, user: None, password: None,
-                       look_every: None, weight: 1.0, record: true, live: true, encode: false, motion_mask: Vec::new() };
+                       look_every: None, weight: 1.0, record: true, live: true, encode: false, motion_mask: Vec::new(), safety: None };
     runner.set_cameras(&[cam]).unwrap();
     let (health, tap) = {
         let views = runner.shared.cameras.lock().unwrap();

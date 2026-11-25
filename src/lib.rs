@@ -35,12 +35,16 @@
 pub mod camera;
 pub mod config;
 pub mod coord;
+pub mod datalog;
 mod detector;
+pub mod drift;
 #[cfg(feature = "fold")]
 pub mod fold;
+pub mod grammar;
 pub mod http;
 pub mod image;
 mod kalman;
+pub mod lens;
 pub mod light;
 pub mod motion;
 pub mod regions;
@@ -50,6 +54,7 @@ pub mod retention;
 pub mod onvif;
 #[cfg(feature = "cameras")]
 pub mod runner;
+pub mod safety;
 mod tracker;
 
 pub use detector::{Detector, DetectorOptions};

@@ -127,3 +127,40 @@ fn a_region_finds_what_is_small_on_a_big_frame() {
     // Within what yolox_nano_finds_on_gray_frames allows the dog's box, at a third of it.
     assert!(found[0].bbox.iter().zip(dog).all(|(a, b)| (a - b).abs() < 25.0), "{:?} vs {dog:?}", found[0].bbox);
 }
+
+#[test]
+fn the_ppe_look_crops_at_full_size_and_maps_finds_back() {
+    // The PPE look with YOLOX-Nano standing in for a PPE model: "dog" is mapped to "helmet",
+    // and a person box is put around the dog. The look must find it in its crop, put the find
+    // back where the dog is in the whole frame, and drop the main detector's helmet there.
+    use tamserve_boxes::grammar::Detection;
+    use tamserve_boxes::safety::{SafetyCam, SafetySpec};
+    let Some((model, gray, w, h)) = inputs() else { return eprintln!("skipped: TAMSERVE_YOLOX_ONNX / TAMSERVE_DOG_JPG not set") };
+    let folded = gray_model(&model);
+    let mut whole = Detector::new(&folded, classes()).unwrap();
+    let f = whole.detect(&[GrayFrame::new(&gray, w, h).unwrap()]).unwrap().remove(0);
+    let dog_k = (0..f.len()).find(|&k| whole.names()[f.labels[k]] == "dog").expect("the dog on the whole frame");
+    let dog = f.boxes[dog_k];
+    // the golden file is a valid spec; add the look
+    let mut spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/vg360_grammar_golden.json")).unwrap()).unwrap();
+    spec["ppe_look"] = serde_json::json!({"model": folded, "most": 2, "threads": 1});
+    spec["labels"] = serde_json::json!({"dog": "helmet"});
+    let path = std::env::temp_dir().join(format!("tamserve-look-{}.json", std::process::id()));
+    std::fs::write(&path, spec.to_string()).unwrap();
+    let mut cam = SafetyCam::new(SafetySpec::load(&path).unwrap()).unwrap();
+    // a person whose head-and-torso band (10 % above the box to 65 % down) holds the dog
+    let (dh, dw) = ((dog[3] - dog[1]) as f64, (dog[2] - dog[0]) as f64);
+    let person = [dog[0] as f64 - 0.3 * dw, dog[1] as f64 - 0.05 * dh, dog[2] as f64 + 0.3 * dw, dog[1] as f64 + 1.45 * dh];
+    let planted = Detection { cls: "helmet".into(), conf: 0.2, bbox: [person[0] + 2.0, person[1] + 2.0, person[0] + 12.0, person[1] + 12.0] };
+    let mut dets = vec![Detection { cls: "person".into(), conf: 0.9, bbox: person }, planted.clone()];
+    assert_eq!(cam.look_ppe(&gray, w, h, &[7, 0], &mut dets).unwrap(), 1);
+    assert!(!dets.contains(&planted), "the main detector's helmet inside the look is replaced");
+    let found = dets.iter().find(|d| d.cls == "helmet").expect("the look's find, mapped to helmet");
+    let b = [found.bbox[0] as f32, found.bbox[1] as f32, found.bbox[2] as f32, found.bbox[3] as f32];
+    let inter = (b[2].min(dog[2]) - b[0].max(dog[0])).max(0.0) * (b[3].min(dog[3]) - b[1].max(dog[1])).max(0.0);
+    let iou = inter / ((b[2] - b[0]) * (b[3] - b[1]) + (dog[2] - dog[0]) * (dog[3] - dog[1]) - inter);
+    assert!(iou > 0.5, "mapped back onto the dog: {b:?} vs {dog:?} (IoU {iou:.2})");
+    assert_eq!(cam.ppe_looks_total, 1);
+    let _ = std::fs::remove_file(&path);
+}

@@ -43,7 +43,7 @@ fn day_then_ir_night_is_one_switch() {
     }
     camera::init(Decoder::Software).unwrap();
     let cam = Camera { name: "dusk".into(), url: video.display().to_string(), onvif: None, user: None, password: None,
-                       look_every: None, weight: 1.0, record: false, live: false, encode: false, motion_mask: Vec::new() };
+                       look_every: None, weight: 1.0, record: false, live: false, encode: false, motion_mask: Vec::new(), safety: None };
     let src = Source::open(cam, &Opening::from(&DecodeSection { realtime: true, ..Default::default() }),
                            Arc::new(Bell::default())).unwrap();
 
