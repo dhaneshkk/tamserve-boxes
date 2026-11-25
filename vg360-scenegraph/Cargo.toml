@@ -1,0 +1,19 @@
+[package]
+name = "vg360-scenegraph"
+version = "0.1.0"
+edition = "2021"
+description = "Floor-plane scene graph for VisionGuard360: per-deck homographies, Kalman tracks in metres, suspended-load drop zones, conservative uncertainty-aware facts for iogp-runtime."
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["iogp"]
+# FactSink impls for iogp_runtime::Engine / Frame and polarity derived from config.json
+iogp = ["dep:iogp-runtime"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+iogp-runtime = { git = "https://github.com/dhaneshkk/test1_logpeditor", rev = "499cf14a79425eaabe603c3e6fc7d10944df8dd7", optional = true }
+
+[profile.release]
+debug = false
