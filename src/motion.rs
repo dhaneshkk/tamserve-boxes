@@ -17,6 +17,8 @@
 //! average for a while: the gate stays awake longer. It errs towards looking, never
 //! towards missing.
 
+use fearless_simd::{dispatch, Level, Simd};
+use fearless_simd_macros::simd;
 use crate::{BBox, GrayFrame};
 
 /// How motion is found. `Default` is Frigate's.
@@ -92,6 +94,9 @@ pub struct MotionDetector {
     grown: Vec<bool>,
     seen: Vec<bool>,
     stack: Vec<usize>,
+    /// Row sums for [`shrink`], and the CPU's SIMD level, found once.
+    sums: Vec<u16>,
+    level: Level,
     /// Times the whole picture changed and the average was started again.
     pub lighting_resets: u64,
 }
@@ -99,7 +104,8 @@ pub struct MotionDetector {
 impl MotionDetector {
     pub fn new(opts: MotionOptions) -> MotionDetector {
         MotionDetector { opts, average: Vec::new(), small: (0, 0), frame: (0, 0), pixels: Vec::new(), masked: Vec::new(), open: 0, mask: Vec::new(),
-                         grown: Vec::new(), seen: Vec::new(), stack: Vec::new(), lighting_resets: 0 }
+                         grown: Vec::new(), seen: Vec::new(), stack: Vec::new(), sums: Vec::new(), level: Level::new(),
+                         lighting_resets: 0 }
     }
 
     /// Forget the past: the next frame only starts the average.
@@ -124,7 +130,7 @@ impl MotionDetector {
             self.open = self.masked.iter().filter(|&&m| !m).count().max(1);
         }
         let (w, h) = self.small;
-        shrink(f, w, h, &mut self.pixels);
+        shrink(self.level, f, w, h, &mut self.pixels, &mut self.sums);
         if self.average.len() != w * h {
             self.average = self.pixels.iter().map(|&p| p as f32).collect();
             return Motion::default();
@@ -152,25 +158,88 @@ impl MotionDetector {
     }
 }
 
-/// `f` shrunk to `w` x `h` by averaging the pixels each small pixel covers.
-fn shrink(f: &GrayFrame, w: usize, h: usize, out: &mut Vec<u8>) {
+/// `f` shrunk to `w` x `h` by averaging the pixels each small pixel covers, rounding half up.
+///
+/// Most of the motion gate's time is here: every full-size pixel of every frame is added
+/// once. Each band of rows is first added up column by column into `sums` (whole rows at a
+/// time, in the CPU's widest SIMD, picked at run time), then each small pixel adds up its
+/// own columns of that one row. Integer sums in any order are the same sums, so this gives
+/// exactly what [`shrink_reference`] gives.
+#[doc(hidden)]
+pub fn shrink(level: Level, f: &GrayFrame, w: usize, h: usize, out: &mut Vec<u8>, sums: &mut Vec<u16>) {
     out.clear();
     out.resize(w * h, 0);
-    let mut sums = vec![0u32; w];
-    let cols: Vec<(usize, usize)> = (0..w).map(|x| (x * f.width / w, ((x + 1) * f.width / w).max(x * f.width / w + 1))).collect();
+    let cols = columns(f.width, w);
     for y in 0..h {
-        let (r0, r1) = (y * f.height / h, ((y + 1) * f.height / h).max(y * f.height / h + 1));
-        sums.iter_mut().for_each(|s| *s = 0);
-        for r in r0..r1 {
-            let row = f.row(r);
-            for (s, &(c0, c1)) in sums.iter_mut().zip(&cols) {
-                *s += row[c0..c1].iter().map(|&p| p as u32).sum::<u32>();
-            }
+        let (r0, r1) = band(y, f.height, h);
+        if r1 - r0 > BAND_ROWS {
+            // Too many rows for 16-bit sums: a picture over 25,000 rows tall per 100 small rows.
+            shrink_band_reference(f, &cols, r0, r1, &mut out[y * w..(y + 1) * w]);
+            continue;
         }
-        for (x, (&s, &(c0, c1))) in sums.iter().zip(&cols).enumerate() {
+        sums.clear();
+        sums.resize(f.width, 0);
+        let rows = &f.pixels[r0 * f.stride..];
+        dispatch!(level, simd => add_rows(simd, sums, rows, f.stride, r1 - r0));
+        for (o, &(c0, c1)) in out[y * w..(y + 1) * w].iter_mut().zip(&cols) {
+            let s: u32 = sums[c0..c1].iter().map(|&v| v as u32).sum();
             let n = ((r1 - r0) * (c1 - c0)) as u32;
-            out[y * w + x] = ((s + n / 2) / n) as u8;
+            *o = ((s + n / 2) / n) as u8;
         }
+    }
+}
+
+/// The most rows a band may have for its column sums to fit 16 bits: 257 x 255 < 65,536.
+const BAND_ROWS: usize = 257;
+
+/// `sums[x] += rows[r * stride + x]` for the first `n` rows. Written plainly so the compiler
+/// vectorises it, once per SIMD level, as `#[simd]` asks.
+#[simd]
+fn add_rows<S: Simd>(_: S, sums: &mut [u16], rows: &[u8], stride: usize, n: usize) {
+    let width = sums.len();
+    for r in 0..n {
+        let row = &rows[r * stride..r * stride + width];
+        for (s, &p) in sums.iter_mut().zip(row) {
+            *s += p as u16;
+        }
+    }
+}
+
+/// Which full-size columns each of `w` small columns covers: `[c0, c1)`, never empty.
+fn columns(width: usize, w: usize) -> Vec<(usize, usize)> {
+    (0..w).map(|x| (x * width / w, ((x + 1) * width / w).max(x * width / w + 1))).collect()
+}
+
+/// Which full-size rows small row `y` of `h` covers.
+fn band(y: usize, height: usize, h: usize) -> (usize, usize) {
+    (y * height / h, ((y + 1) * height / h).max(y * height / h + 1))
+}
+
+/// One small row, the plain way.
+fn shrink_band_reference(f: &GrayFrame, cols: &[(usize, usize)], r0: usize, r1: usize, out: &mut [u8]) {
+    let mut sums = vec![0u32; cols.len()];
+    for r in r0..r1 {
+        let row = f.row(r);
+        for (s, &(c0, c1)) in sums.iter_mut().zip(cols) {
+            *s += row[c0..c1].iter().map(|&p| p as u32).sum::<u32>();
+        }
+    }
+    for ((o, &s), &(c0, c1)) in out.iter_mut().zip(&sums).zip(cols) {
+        let n = ((r1 - r0) * (c1 - c0)) as u32;
+        *o = ((s + n / 2) / n) as u8;
+    }
+}
+
+/// [`shrink`] the plain way, small pixel by small pixel: what it must match, and what the
+/// benchmark compares it with.
+#[doc(hidden)]
+pub fn shrink_reference(f: &GrayFrame, w: usize, h: usize, out: &mut Vec<u8>) {
+    out.clear();
+    out.resize(w * h, 0);
+    let cols = columns(f.width, w);
+    for y in 0..h {
+        let (r0, r1) = band(y, f.height, h);
+        shrink_band_reference(f, &cols, r0, r1, &mut out[y * w..(y + 1) * w]);
     }
 }
 
@@ -278,6 +347,56 @@ mod tests {
     }
 
     #[test]
+    fn the_simd_shrink_is_the_plain_one_exactly() {
+        let mut seed = 7u32;
+        let mut noise = || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); (seed >> 24) as u8 };
+        let sizes = [(1920, 1080, 100), (1280, 720, 100), (704, 576, 100), (641, 359, 100), (33, 17, 8),
+                     (100, 100, 100), (8, 8, 100), (3840, 2160, 100), (1920, 1080, 37), (17, 4000, 9)];
+        let (mut a, mut b, mut sums) = (Vec::new(), Vec::new(), Vec::new());
+        for &(w, h, small_h) in &sizes {
+            for pad in [0, 13] {
+                let stride = w + pad;
+                let mut px: Vec<u8> = (0..stride * h).map(|_| noise()).collect();
+                // The extremes too: a band of all 255 must not wrap the 16-bit sums.
+                px[..stride * (h / 3)].iter_mut().for_each(|p| *p = 255);
+                let f = GrayFrame::with_stride(&px, w, h, stride).unwrap();
+                let small_h = small_h.min(h);
+                let small_w = ((w * small_h) as f64 / h as f64).round().max(1.0) as usize;
+                shrink_reference(&f, small_w, small_h, &mut a);
+                for level in levels() {
+                    shrink(level, &f, small_w, small_h, &mut b, &mut sums);
+                    assert_eq!(a, b, "{w}x{h} (stride {stride}) to {small_w}x{small_h} with {level:?}");
+                }
+            }
+        }
+    }
+
+    /// Every SIMD level this CPU has, so each compiled version is checked, not only the best.
+    fn levels() -> Vec<Level> {
+        let best = Level::new();
+        let mut all = vec![Level::baseline(), best];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            all.extend(best.as_sse4_2().map(Level::Sse4_2));
+            all.extend(best.as_avx2().map(Level::Avx2));
+            all.extend(best.as_avx512().map(Level::Avx512));
+        }
+        all
+    }
+
+    #[test]
+    fn bands_too_tall_for_16_bits_take_the_plain_way() {
+        // 300 rows per small row: 300 x 255 does not fit in 16 bits.
+        let px = vec![255u8; 4 * 3000];
+        let f = GrayFrame::new(&px, 4, 3000).unwrap();
+        let (mut a, mut b, mut sums) = (Vec::new(), Vec::new(), Vec::new());
+        shrink_reference(&f, 1, 10, &mut a);
+        shrink(Level::new(), &f, 1, 10, &mut b, &mut sums);
+        assert_eq!(a, b);
+        assert!(b.iter().all(|&p| p == 255));
+    }
+
+    #[test]
     fn a_still_picture_has_no_motion() {
         let mut d = MotionDetector::new(MotionOptions::default());
         let p = frame(640, 360, 90, Some((100, 100, 40, 200)));
@@ -339,7 +458,7 @@ mod tests {
     fn shrinking_averages() {
         let p = [0u8, 10, 20, 30, 40, 50, 60, 70];
         let mut out = Vec::new();
-        shrink(&GrayFrame::new(&p, 4, 2).unwrap(), 2, 1, &mut out);
+        shrink(Level::new(), &GrayFrame::new(&p, 4, 2).unwrap(), 2, 1, &mut out, &mut Vec::new());
         assert_eq!(out, [(10 + 40 + 50 + 2) / 4, (20 + 30 + 60 + 70 + 2) / 4]);
     }
 

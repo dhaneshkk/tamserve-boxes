@@ -383,6 +383,20 @@ The detector has to know the classes: `person`, `forklift`, `helmet`, `vest`, `b
 | 8 × 25 | Rust, 8 processes | 1.02 | 880 MB | 23.6 |
 | 8 × 25 | Python, 8 processes | 1.05 | 1,544 MB | 21.9 |
 
+### The motion gate's SIMD
+
+The motion gate runs on every decoded frame, even on cameras YOLOX skips, and nearly all of its time is shrinking each frame to 100 rows. That shrink adds whole rows at a time into 16-bit sums, which the compiler vectorises. Through [fearless_simd](https://github.com/linebender/fearless_simd) it's compiled once for each SIMD level (SSE2, SSE4.2, AVX2, AVX-512, NEON on ARM), and the best one is picked at run time, so one binary suits every box. The result is the plain code's exactly, at every level, and the tests check it.
+
+`cargo run --release --example motion_bench` on a 2-core cloud VM with AVX-512, in ms per frame:
+
+| frame | shrink, plain | same code, SSE2 only | best level, picked at run time | whole gate |
+|---|---|---|---|---|
+| 704×576 | 0.328 | 0.086 | **0.063** (5.2×) | 0.104 |
+| 1280×720 | 0.576 | 0.143 | **0.120** (4.8×) | 0.174 |
+| 1920×1080 | 0.878 | 0.228 | **0.174** (5.0×) | 0.228 |
+
+Most of the gain comes from adding row by row, which vectorises even for plain SSE2. Picking AVX-512 at run time adds about 1.3× on top. At 100 cameras × 25 fps of 704×576, the gate falls from about 1.1 cores to about 0.26.
+
 ### Compressed swap (zram) on Ubuntu
 
 zram gives a box more room to spare, but it doesn't make room for more cameras. Detection memory is almost all in use every frame: weights of a few MB, per-frame buffers that are reused, and ring buffers of decoded frames. Pages in use don't get swapped, and the incoming H.264 barely compresses anyway. What zram does compress is the box's idle memory: other services, logs, the parts of a database not being queried. That's headroom against running out of memory. It costs CPU on the cores detection uses, so it's set up to cost little:
@@ -437,7 +451,8 @@ scripts/rtsp_test.sh yolox_nano_gray.onnx some_h264.mp4    # end to end, needs m
   - the coordinator over loopback: wrong token, a stalled handshake cut off, changed and replayed messages refused, spreading by capacity, failover, cameras a box doesn't know, a box reconnecting;
   - the tracker tests ported from Python;
   - the model tests, including that splitting a look across requests changes nothing;
-  - motion: still pictures, a moving square found where it is, specks, the light changing, masks, the gate holding open;
+  - motion: still pictures, a moving square found where it is, specks, the light changing, masks, the gate holding open; the SIMD shrink equal to the plain one at every SIMD level the CPU has, for odd sizes, padded rows, all-255 bands, and bands too tall for 16-bit sums;
+  - `bench`: pictures of any size, including ones bigger than its 720p frames;
   - regions: squares around small things, inside the frame, joined when they overlap, the whole frame when they wouldn't help, finds moved back and cut ones left out, duplicates; in the tracker, cropped looks landing where the whole-frame ones do; with the model, the small dog found only through a region;
   - the gate in the tracker: never quiet changes nothing, quiet cameras cost no looks, what is followed is still followed;
   - retention: each kind of segment's days, the seconds before and after an event, segments past the log, the space order, pins, a sweep on disk, a bad pins file;
