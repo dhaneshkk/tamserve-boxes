@@ -447,7 +447,7 @@ impl SceneBuilder {
                 let mut rels = [false; 5];
                 if area(&bb) > 0.0 && inter(&ba, &bb) / area(&bb) >= minc {
                     let bclass = &self.tracks[b.slot].class;
-                    rels[R_WEAR as usize] = self.params.ppe_bands.iter().find(|p| &p.class == bclass).map_or(true, |p| {
+                    rels[R_WEAR as usize] = self.params.ppe_bands.iter().find(|p| &p.class == bclass).is_none_or(|p| {
                         let f = ((bb[1] + bb[3]) / 2.0 - ba[1]) / (ba[3] - ba[1]).max(1e-9);
                         f >= p.top && f <= p.bottom
                     });

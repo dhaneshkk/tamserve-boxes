@@ -133,8 +133,8 @@ fn coasting_keeps_duration_timers_through_occlusion() {
             let y = 11.0;
             // feet visible until 1.5 s, feet hidden 1.5-2.0 s, fully hidden 2.0-3.5 s
             let mut b = bbox(&p, 0.0, y, 0.0, 0.5, 1.75);
-            if t >= 1.5 - 1e-9 && t < 2.0 - 1e-9 { b[3] = foot.1 - 30.0; }
-            let dets: Vec<Det> = if t >= 2.0 - 1e-9 && t < 3.5 - 1e-9 { vec![] } else { vec![Det { track_id: 1, class: "person", bbox: b, score: 0.9 }] };
+            if (1.5 - 1e-9..2.0 - 1e-9).contains(&t) { b[3] = foot.1 - 30.0; }
+            let dets: Vec<Det> = if (2.0 - 1e-9..3.5 - 1e-9).contains(&t) { vec![] } else { vec![Det { track_id: 1, class: "person", bbox: b, score: 0.9 }] };
             sg.step(t, &dets, true, &mut e);
             got |= e.end().iter().any(|ev| ev.kind == "raised" && ev.rule == "LSR1");
         }
@@ -159,7 +159,7 @@ fn coasting_worker_keeps_ppe() {
         let hidden_feet = t >= 1.0 - 1e-9;
         if hidden_feet { b[3] = foot.1 - 30.0; }
         let harness = [b[0] + 4.0, b[1] + (b[3] - b[1]) * 0.25, b[2] - 4.0, b[1] + (b[3] - b[1]) * 0.55];
-        let dets: Vec<Det> = if t >= 2.0 - 1e-9 && t < 3.8 { vec![] } else {
+        let dets: Vec<Det> = if (2.0 - 1e-9..3.8).contains(&t) { vec![] } else {
             vec![Det { track_id: 1, class: "person", bbox: b, score: 0.9 }, Det { track_id: 5, class: "harness", bbox: harness, score: 0.8 }]
         };
         sg.step(t, &dets, true, &mut e);
